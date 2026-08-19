@@ -9,8 +9,8 @@ from aiogram.fsm.state import State, StatesGroup
 logging.basicConfig(level=logging.INFO)
 
 # === ВСТАВЬ СВОИ ДАННЫЕ ===
-BOT_TOKEN = "ТВОЙ_ТОКЕН"
-SENIOR_CHAT_ID = "-100_ТВОЙ_ID"
+BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
+SENIOR_CHAT_ID = "6516986078"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()

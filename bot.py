@@ -15,7 +15,8 @@ SENIOR_CHAT_ID = "6516986078"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Список для хранения заявок
+# База данных заявок (храним в памяти)
+# Каждая заявка будет иметь уникальный id (индекс)
 ACTIVE_TICKETS = []
 
 class EscalateForm(StatesGroup):
@@ -23,7 +24,7 @@ class EscalateForm(StatesGroup):
     client_name = State()
     comment = State()
 
-# Постоянная клавиатура внизу экрана (Reply)
+# Постоянная клавиатура внизу экрана
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Создать заявку")],
@@ -39,11 +40,6 @@ urgency_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🔴 Высокая", callback_data="urgency_high")]
 ])
 
-# Кнопка для сеньоров
-take_task_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="✋ Взять себе", callback_data="take_task")]
-])
-
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -52,7 +48,7 @@ async def cmd_start(message: Message, state: FSMContext):
         reply_markup=main_menu_kb
     )
 
-# Обработка нажатия на кнопку меню "Создать заявку"
+# Создание заявки через меню
 @dp.message(F.text == "📝 Создать заявку")
 async def start_form_btn(message: Message, state: FSMContext):
     await state.clear()
@@ -82,6 +78,7 @@ async def process_comment(message: Message, state: FSMContext):
     await state.update_data(comment=message.text)
     await message.answer("⚠️ Выберите **срочность заявки**:", reply_markup=urgency_kb)
 
+# Сохранение заявки
 @dp.callback_query(F.data.startswith("urgency_"))
 async def process_urgency(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -93,15 +90,21 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     }
     urgency_text = urgency_dict[callback.data]
 
+    # Создаем новую задачу в общей базе
+    ticket_id = len(ACTIVE_TICKETS)
     ticket_info = {
+        "id": ticket_id,
         "ticket": data['ticket_number'],
         "client": data['client_name'],
         "comment": data['comment'],
         "urgency": urgency_text,
-        "author": callback.from_user.username
+        "author": callback.from_user.username,
+        "status": "🔴 НОВАЯ",
+        "assignee": None
     }
     ACTIVE_TICKETS.append(ticket_info)
 
+    # Дублируем уведомление в чат эскалаций
     ticket_msg = (
         f"🔴 <b>НОВАЯ ЭСКАЛАЦИЯ</b>\n"
         f"От: @{ticket_info['author']}\n\n"
@@ -110,43 +113,75 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
         f"💬 <b>Комментарий:</b> {ticket_info['comment']}\n"
         f"⚡ <b>Срочность:</b> {ticket_info['urgency']}"
     )
+    
+    # Кнопка прямого взятия задачи из чата сеньоров тоже доступна
+    chat_take_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✋ Взять себе", callback_data=f"take_{ticket_id}")]
+    ])
 
     await bot.send_message(
         chat_id=SENIOR_CHAT_ID,
         text=ticket_msg,
-        reply_markup=take_task_kb,
+        reply_markup=chat_take_kb,
         parse_mode="HTML"
     )
     
-    await callback.message.edit_text("✅ Заявка успешно сформирована и передана старшим!")
+    await callback.message.edit_text("✅ Заявка успешно создана и добавлена в общую базу!")
     await state.clear()
 
-# Обработка кнопки меню "Активные заявки"
+# === ПРОСМОТР ПУЛА ЗАЯВОК И ВЫБОР СВОИХ ===
 @dp.message(F.text == "📋 Активные заявки")
 async def show_active_tickets(message: Message):
-    if not ACTIVE_TICKETS:
-        await message.answer("📭 На данный момент активных заявок нет.", reply_markup=main_menu_kb)
+    # Фильтруем только те, что еще не взяты в работу
+    free_tickets = [t for t in ACTIVE_TICKETS if t["status"] == "🔴 НОВАЯ"]
+
+    if not free_tickets:
+        await message.answer("📭 Свободных активных заявок нет.", reply_markup=main_menu_kb)
         return
 
-    text = "📋 <b>Список активных заявок:</b>\n\n"
-    for i, t in enumerate(ACTIVE_TICKETS, 1):
-        text += (
-            f"<b>{i}. Заявка №{t['ticket']}</b>\n"
-            f"   • Клиент: {t['client']}\n"
-            f"   • Срочность: {t['urgency']}\n"
-            f"   • Комментарий: {t['comment']}\n"
-            f"   • Автор: @{t['author']}\n\n"
-        )
-    
-    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb)
+    await message.answer("📋 <b>Выберите заявку, которую хотите взять в работу:</b>", parse_mode="HTML", reply_markup=main_menu_kb)
 
-@dp.callback_query(F.data == "take_task")
-async def handle_take_task(callback: CallbackQuery):
-    senior_username = callback.from_user.username
-    original_text = callback.message.text
-    new_text = original_text.replace("🔴 НОВАЯ ЭСКАЛАЦИЯ", f"🟡 В РАБОТЕ (Взял: @{senior_username})")
-    await callback.message.edit_text(new_text)
-    await callback.answer("Ты взял задачу в работу!", show_alert=True)
+    # Выводим каждую заявку отдельным сообщением с кнопкой "Взять"
+    for t in free_tickets:
+        text = (
+            f"📌 <b>Заявка №{t['ticket']}</b>\n"
+            f"👤 Клиент: {t['client']}\n"
+            f"⚡ Срочность: {t['urgency']}\n"
+            f"💬 Комментарий: {t['comment']}\n"
+            f"👤 Автор: @{t['author']}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✋ Взять эту заявку", callback_data=f"take_{t['id']}")]
+        ])
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+# === ОБРАБОТКА ВЗЯТИЯ ЗАЯВКИ ЛЮБЫМ ПОЛЬЗОВАТЕЛЕМ ===
+@dp.callback_query(F.data.startswith("take_"))
+async def handle_take_custom_task(callback: CallbackQuery):
+    # Достаем ID заявки из callback_data (например, "take_0" -> 0)
+    ticket_id = int(callback.data.split("_")[1])
+    
+    ticket = ACTIVE_TICKETS[ticket_id]
+    
+    if ticket["status"] == "🟡 В РАБОТЕ":
+        await callback.answer("⚠️ Эту заявку уже кто-то взял!", show_alert=True)
+        return
+
+    # Меняем статус
+    ticket["status"] = "🟡 В РАБОТЕ"
+    ticket["assignee"] = callback.from_user.username
+
+    # Обновляем текст сообщения
+    new_text = (
+        f"🟡 <b>В РАБОТЕ (Взял: @{ticket['assignee']})</b>\n\n"
+        f"📌 <b>Номер заявки:</b> {ticket['ticket']}\n"
+        f"👤 <b>Клиент:</b> {ticket['client']}\n"
+        f"💬 <b>Комментарий:</b> {ticket['comment']}\n"
+        f"⚡ <b>Срочность:</b> {ticket['urgency']}"
+    )
+
+    await callback.message.edit_text(new_text, parse_mode="HTML")
+    await callback.answer("Вы успешно взяли заявку в работу!", show_alert=True)
 
 async def main():
     await dp.start_polling(bot)

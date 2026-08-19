@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,11 +15,23 @@ SENIOR_CHAT_ID = "6516986078"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Состояния нашей анкеты
+# Хранилище для всех созданных заявок (в памяти бота)
+ACTIVE_TICKETS = []
+
+# Состояния анкеты
 class EscalateForm(StatesGroup):
     ticket_number = State()
     client_name = State()
     comment = State()
+
+# 1. Постоянное меню внизу экрана (Reply-кнопки)
+main_menu_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📝 Создать заявку")],
+        [KeyboardButton(text="📋 Активные заявки")]
+    ],
+    resize_keyboard=True
+)
 
 # Кнопки выбора срочности
 urgency_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -36,36 +48,42 @@ take_task_kb = InlineKeyboardMarkup(inline_keyboard=[
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Привет! Для создания заявки просто напиши /escalate")
+    await message.answer(
+        "Привет! Используй меню внизу экрана для управления заявками.",
+        reply_markup=main_menu_kb
+    )
 
-# Шаг 0: Пользователь пишет /escalate (больше ничего писать не нужно)
-@dp.message(Command("escalate"))
-async def start_form(message: Message, state: FSMContext):
+# === КНОПКА МЕНЮ: СОЗДАТЬ ЗАЯВКУ ===
+@dp.message(F.text == "📝 Создать заявку")
+async def start_form_btn(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("📝 Введите **номер заявки**:")
     await state.set_state(EscalateForm.ticket_number)
 
-# Шаг 1: Принимаем номер заявки, спрашиваем клиента
+# Дублируем на случай, если кто-то напишет командой
+@dp.message(Command("escalate"))
+async def start_form_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📝 Введите **номер заявки**:")
+    await state.set_state(EscalateForm.ticket_number)
+
 @dp.message(EscalateForm.ticket_number)
 async def process_ticket(message: Message, state: FSMContext):
     await state.update_data(ticket_number=message.text)
-    await message.answer("👤 Введите **данные клиента** (любая информация):")
+    await message.answer("👤 Введите **данные клиента**:")
     await state.set_state(EscalateForm.client_name)
 
-# Шаг 2: Принимаем клиента, спрашиваем комментарий
 @dp.message(EscalateForm.client_name)
 async def process_client(message: Message, state: FSMContext):
     await state.update_data(client_name=message.text)
     await message.answer("💬 Введите **комментарий** к заявке:")
     await state.set_state(EscalateForm.comment)
 
-# Шаг 3: Принимаем комментарий и просим выбрать срочность
 @dp.message(EscalateForm.comment)
 async def process_comment(message: Message, state: FSMContext):
     await state.update_data(comment=message.text)
     await message.answer("⚠️ Выберите **срочность заявки**:", reply_markup=urgency_kb)
 
-# Шаг 4: Обработка нажатия на срочность и отправка тикета сеньорам
 @dp.callback_query(F.data.startswith("urgency_"))
 async def process_urgency(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -77,14 +95,24 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     }
     urgency_text = urgency_dict[callback.data]
 
-    # Собираем красивую карточку-таблицу
+    # Сохраняем заявку в общий список активных
+    ticket_info = {
+        "ticket": data['ticket_number'],
+        "client": data['client_name'],
+        "comment": data['comment'],
+        "urgency": urgency_text,
+        "author": callback.from_user.username
+    }
+    ACTIVE_TICKETS.append(ticket_info)
+
+    # Собираем карточку
     ticket_msg = (
         f"🔴 <b>НОВАЯ ЭСКАЛАЦИЯ</b>\n"
-        f"От: @{callback.from_user.username}\n\n"
-        f"📌 <b>Номер заявки:</b> {data['ticket_number']}\n"
-        f"👤 <b>Клиент:</b> {data['client_name']}\n"
-        f"💬 <b>Комментарий:</b> {data['comment']}\n"
-        f"⚡ <b>Срочность:</b> {urgency_text}"
+        f"От: @{ticket_info['author']}\n\n"
+        f"📌 <b>Номер заявки:</b> {ticket_info['ticket']}\n"
+        f"👤 <b>Клиент:</b> {ticket_info['client']}\n"
+        f"💬 <b>Комментарий:</b> {ticket_info['comment']}\n"
+        f"⚡ <b>Срочность:</b> {ticket_info['urgency']}"
     )
 
     # Отправляем в чат сеньоров
@@ -98,9 +126,28 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("✅ Заявка успешно сформирована и передана старшим!")
     await state.clear()
 
+# === КНОПКА МЕНЮ: ПОСМОТРЕТЬ ПУЛ ЗАЯВОК ===
+@dp.message(F.text == "📋 Активные заявки")
+async def show_active_tickets(message: Message):
+    if not ACTIVE_TICKETS:
+        await message.answer("📭 На данный момент активных заведенных заявок нет.")
+        return
+
+    text = "📋 <b>Список активных заявок:</b>\n\n"
+    for i, t in enumerate(ACTIVE_TICKETS, 1):
+        text += (
+            f"<b>{i}. Заявка №{t['ticket']}</b>\n"
+            f"   • Клиент: {t['client']}\n"
+            f"   • Срочность: {t['urgency']}\n"
+            f"   • Комментарий: {t['comment']}\n"
+            f"   • Автор: @{t['author']}\n\n"
+        )
+    
+    await message.answer(text, parse_mode="HTML")
+
 # Кнопка сеньоров "Взять себе"
 @dp.callback_query(F.data == "take_task")
-async def handle_take_task(callback: CallbackQuery):
+async def handle_take_take(callback: CallbackQuery):
     senior_username = callback.from_user.username
     original_text = callback.message.text
     

@@ -8,7 +8,6 @@ from aiogram.fsm.state import State, StatesGroup
 
 logging.basicConfig(level=logging.INFO)
 
-# === ВСТАВЬ СВОИ ДАННЫЕ ===
 BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
 SENIOR_CHAT_ID = "6516986078"
 
@@ -22,7 +21,6 @@ class EscalateForm(StatesGroup):
     client_name = State()
     comment = State()
 
-# Нижнее меню
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Создать заявку")],
@@ -31,7 +29,6 @@ main_menu_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Срочность
 urgency_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🟢 Низкая", callback_data="urgency_low")],
     [InlineKeyboardButton(text="🟡 Средняя", callback_data="urgency_mid")],
@@ -43,7 +40,6 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("👋 Привет! Используй меню внизу для управления заявками.", reply_markup=main_menu_kb)
 
-# Создание заявки
 @dp.message(F.text == "📝 Создать заявку")
 @dp.message(Command("escalate"))
 async def start_form(message: Message, state: FSMContext):
@@ -68,7 +64,7 @@ async def process_comment(message: Message, state: FSMContext):
     await state.update_data(comment=message.text)
     await message.answer("⚠️ Выберите **срочность заявки**:", reply_markup=urgency_kb)
 
-# Сохранение заявки
+# Сохранение заявки без автоматического вывода кнопки "взять" создателю
 @dp.callback_query(F.data.startswith("urgency_"))
 async def process_urgency(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -88,6 +84,7 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     }
     ACTIVE_TICKETS.append(ticket_info)
 
+    # Уведомление в общий чат с кнопкой взятия
     ticket_msg = (
         f"🔴 <b>НОВАЯ ЭСКАЛАЦИЯ</b>\n"
         f"От: @{ticket_info['author']}\n\n"
@@ -106,7 +103,8 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     
-    await callback.message.edit_text("✅ Заявка успешно создана и добавлена в общую базу!")
+    # Просто подтверждаем создание без лишних кнопок автору
+    await callback.message.edit_text("✅ Заявка успешно создана и добавлена в общий пул задач!")
     await state.clear()
 
 # Просмотр активных заявок
@@ -118,7 +116,7 @@ async def show_active_tickets(message: Message):
         await message.answer("📭 Свободных активных заявок сейчас нет.", reply_markup=main_menu_kb)
         return
 
-    await message.answer("📋 <b>Доступные заявки:</b>", parse_mode="HTML", reply_markup=main_menu_kb)
+    await message.answer("📋 <b>Доступные заявки в пуле:</b>", parse_mode="HTML", reply_markup=main_menu_kb)
 
     for t in free_tickets:
         text = (
@@ -163,7 +161,6 @@ async def handle_take_task(callback: CallbackQuery):
         f"⚡ <b>Срочность:</b> {ticket['urgency']}"
     )
 
-    # Добавляем кнопку возврата к списку
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 К списку активных заявок", callback_data="back_to_list")]
     ])
@@ -175,11 +172,9 @@ async def handle_take_task(callback: CallbackQuery):
         
     await callback.answer("✅ Вы успешно закрепили заявку за собой!", show_alert=True)
 
-# Кнопка возврата к списку
 @dp.callback_query(F.data == "back_to_list")
 async def back_to_list(callback: CallbackQuery):
-    await callback.message.delete() # Удаляем старое сообщение со взятой задачей
-    # Вызываем функцию показа оставшихся активных заявок
+    await callback.message.delete()
     await show_active_tickets(callback.message)
 
 async def main():

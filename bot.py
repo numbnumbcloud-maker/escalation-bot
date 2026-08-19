@@ -9,22 +9,21 @@ from aiogram.fsm.state import State, StatesGroup
 logging.basicConfig(level=logging.INFO)
 
 # === ВСТАВЬ СВОИ ДАННЫЕ ===
-BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
-SENIOR_CHAT_ID = "6516986078"
+BOT_TOKEN = "ТВОЙ_ТОКЕН"
+SENIOR_CHAT_ID = "-100_ТВОЙ_ID"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище для всех созданных заявок (в памяти бота)
+# Список для хранения заявок
 ACTIVE_TICKETS = []
 
-# Состояния анкеты
 class EscalateForm(StatesGroup):
     ticket_number = State()
     client_name = State()
     comment = State()
 
-# 1. Постоянное меню внизу экрана (Reply-кнопки)
+# Постоянная клавиатура внизу экрана (Reply)
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Создать заявку")],
@@ -33,7 +32,7 @@ main_menu_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Кнопки выбора срочности
+# Инлайн-кнопки выбора срочности
 urgency_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🟢 Низкая", callback_data="urgency_low")],
     [InlineKeyboardButton(text="🟡 Средняя", callback_data="urgency_mid")],
@@ -49,22 +48,21 @@ take_task_kb = InlineKeyboardMarkup(inline_keyboard=[
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Привет! Используй меню внизу экрана для управления заявками.",
+        "Привет! Используй кнопки меню внизу экрана для работы с заявками.",
         reply_markup=main_menu_kb
     )
 
-# === КНОПКА МЕНЮ: СОЗДАТЬ ЗАЯВКУ ===
+# Обработка нажатия на кнопку меню "Создать заявку"
 @dp.message(F.text == "📝 Создать заявку")
 async def start_form_btn(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("📝 Введите **номер заявки**:")
+    await message.answer("📝 Введите **номер заявки**:", reply_markup=main_menu_kb)
     await state.set_state(EscalateForm.ticket_number)
 
-# Дублируем на случай, если кто-то напишет командой
 @dp.message(Command("escalate"))
 async def start_form_cmd(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("📝 Введите **номер заявки**:")
+    await message.answer("📝 Введите **номер заявки**:", reply_markup=main_menu_kb)
     await state.set_state(EscalateForm.ticket_number)
 
 @dp.message(EscalateForm.ticket_number)
@@ -95,7 +93,6 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     }
     urgency_text = urgency_dict[callback.data]
 
-    # Сохраняем заявку в общий список активных
     ticket_info = {
         "ticket": data['ticket_number'],
         "client": data['client_name'],
@@ -105,7 +102,6 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     }
     ACTIVE_TICKETS.append(ticket_info)
 
-    # Собираем карточку
     ticket_msg = (
         f"🔴 <b>НОВАЯ ЭСКАЛАЦИЯ</b>\n"
         f"От: @{ticket_info['author']}\n\n"
@@ -115,7 +111,6 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
         f"⚡ <b>Срочность:</b> {ticket_info['urgency']}"
     )
 
-    # Отправляем в чат сеньоров
     await bot.send_message(
         chat_id=SENIOR_CHAT_ID,
         text=ticket_msg,
@@ -126,11 +121,11 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("✅ Заявка успешно сформирована и передана старшим!")
     await state.clear()
 
-# === КНОПКА МЕНЮ: ПОСМОТРЕТЬ ПУЛ ЗАЯВОК ===
+# Обработка кнопки меню "Активные заявки"
 @dp.message(F.text == "📋 Активные заявки")
 async def show_active_tickets(message: Message):
     if not ACTIVE_TICKETS:
-        await message.answer("📭 На данный момент активных заведенных заявок нет.")
+        await message.answer("📭 На данный момент активных заявок нет.", reply_markup=main_menu_kb)
         return
 
     text = "📋 <b>Список активных заявок:</b>\n\n"
@@ -143,14 +138,12 @@ async def show_active_tickets(message: Message):
             f"   • Автор: @{t['author']}\n\n"
         )
     
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb)
 
-# Кнопка сеньоров "Взять себе"
 @dp.callback_query(F.data == "take_task")
-async def handle_take_take(callback: CallbackQuery):
+async def handle_take_task(callback: CallbackQuery):
     senior_username = callback.from_user.username
     original_text = callback.message.text
-    
     new_text = original_text.replace("🔴 НОВАЯ ЭСКАЛАЦИЯ", f"🟡 В РАБОТЕ (Взял: @{senior_username})")
     await callback.message.edit_text(new_text)
     await callback.answer("Ты взял задачу в работу!", show_alert=True)

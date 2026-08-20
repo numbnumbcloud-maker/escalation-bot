@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 # === ТВОИ ДАННЫЕ ===
 BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
 # ВАЖНО: Укажи ID чата БЕЗ КАВЫЧЕК, как обычное число с минусом!
-SENIOR_CHAT_ID = -1003953261901 
+SENIOR_CHAT_ID = -1004340807494 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()

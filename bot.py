@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # === КОНФИГ ===
 BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
-SENIOR_CHAT_ID = "-1004340807494" # ID рабочей группы (с минусом)
+SENIOR_CHAT_ID = "-1004340807494" # ID рабочей группы с минусом
 
 try:
     GROUP_ID = int(str(SENIOR_CHAT_ID).strip().replace("'", "").replace('"', ''))
@@ -67,7 +67,6 @@ def fetch_query(query, params=()):
 
 # === ХЕЛПЕР ВРЕМЕНИ ===
 def get_elapsed_time(assigned_at_str):
-    """Высчитывает, сколько времени задача находится в работе"""
     if not assigned_at_str: return "—"
     try:
         assigned_dt = datetime.strptime(assigned_at_str, '%Y-%m-%d %H:%M:%S')
@@ -93,9 +92,9 @@ class ReturnForm(StatesGroup):
 # === UI / МЕНЮ ===
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📝 Создать"), KeyboardButton(text="📋 Свободные"), KeyboardButton(text="💼 В работе")],
-        [KeyboardButton(text="👥 Команда"), KeyboardButton(text="🗄 Архив")],
-        [KeyboardButton(text="ℹ️ Помощь")]
+        [KeyboardButton(text="📝 Создать"), KeyboardButton(text="📋 Свободные")],
+        [KeyboardButton(text="💼 В работе"), KeyboardButton(text="👥 Команда")],
+        [KeyboardButton(text="🗄 Архив")]
     ],
     resize_keyboard=True
 )
@@ -110,9 +109,8 @@ def get_user_name(user):
     return f"@{user.username}" if user.username else user.first_name
 
 def build_card(t):
-    """Строгий корпоративный дизайн карточки с таймером"""
     assignee = html.escape(str(t['assignee'])) if t['assignee'] else "—"
-    reason = f"\n⚠️ <b>Причина возврата:</b> <i>{html.escape(str(t['return_reason']))}</i>" if t['return_reason'] else ""
+    reason = f"\n⚠️ <b>Возврат:</b> <i>{html.escape(str(t['return_reason']))}</i>" if t['return_reason'] else ""
     note = f"\n💡 <b>Ремарка:</b> <i>{html.escape(str(t['senior_note']))}</i>" if t['senior_note'] else ""
     
     time_info = ""
@@ -131,22 +129,24 @@ def build_card(t):
     )
 
 def get_action_kb(t_id, is_wip=False):
-    """Генерирует нужные кнопки для карточки"""
+    """Умная генерация кнопок с защитой от мисскликов (на разных строках)"""
     if not is_wip:
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Взять", callback_data=f"take_{t_id}")]])
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✋ Взять в работу", callback_data=f"take_{t_id}")]
+        ])
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"close_{t_id}"),
-         InlineKeyboardButton(text="🔄 Снять с себя", callback_data=f"return_{t_id}")]
+        [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"close_{t_id}")],
+        [InlineKeyboardButton(text="🔄 Снять с себя", callback_data=f"return_{t_id}")]
     ])
 
-# === СМАРТ-РЕПЛАИ (ЗАМЕТКИ В ЧАТЕ) ===
+# === СМАРТ-РЕПЛАИ (ЗАМЕТКИ СТАРШИХ В ЧАТЕ) ===
 @dp.message(F.reply_to_message & F.chat.type.in_({"group", "supergroup"}))
 async def handle_smart_reply(message: Message):
     if message.reply_to_message.from_user.is_bot:
         t_data = fetch_query("SELECT * FROM tickets WHERE group_message_id = ?", (message.reply_to_message.message_id,))
         if t_data:
             t = t_data[0]
-            if t['status'] in [ST_DONE, ST_DEL]: return # Не даем комментить закрытые
+            if t['status'] in [ST_DONE, ST_DEL]: return 
             
             note = f"{message.text} ({get_user_name(message.from_user)})"
             execute_query("UPDATE tickets SET senior_note = ? WHERE id = ?", (note, t['id']))
@@ -159,13 +159,13 @@ async def handle_smart_reply(message: Message):
                 )
                 await message.delete()
 
-# === ФОНОВЫЕ ТАЙМЕРЫ (СВЕРХ-ТОЧНЫЕ) ===
+# === ФОНОВЫЕ ТАЙМЕРЫ ===
 async def monitor_tasks():
     while True:
         await asyncio.sleep(60)
         try:
-            # Тревога пула (15 минут)
-            alarm_tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_NEW}' AND urgency = '🔴 Высокий' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')")
+            # Тревога (Аларм 15 минут в пуле)
+            alarm_tickets = fetch_query("SELECT * FROM tickets WHERE status = ? AND urgency = '🔴 Высокий' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')", (ST_NEW,))
             for t in alarm_tickets:
                 try:
                     sent_msg = await bot.send_message(chat_id=GROUP_ID, text=f"🚨 <b>СЕРЬЕЗНОЕ ОЖИДАНИЕ!</b>\nНикто не берет важную задачу!\n\n{build_card(t)}", reply_markup=get_action_kb(t['id'], False))
@@ -174,26 +174,25 @@ async def monitor_tasks():
                         with suppress(Exception): await bot.delete_message(chat_id=GROUP_ID, message_id=t['group_message_id'])
                 except Exception: pass
 
-            # SLA Напоминание (1 час!)
-            sla_tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_WIP}' AND sla_reminded = 0 AND assigned_at <= datetime('now', '-1 hour')")
+            # Напоминание исполнителю (1 час)
+            sla_tickets = fetch_query("SELECT * FROM tickets WHERE status = ? AND sla_reminded = 0 AND assigned_at <= datetime('now', '-1 hour')", (ST_WIP,))
             for t in sla_tickets:
                 if t['assignee_id']:
                     with suppress(Exception):
-                        await bot.send_message(chat_id=t['assignee_id'], text=f"⏳ <b>НАРУШЕНИЕ SLA (> 1 ЧАСА)</b>\nЗадача висит слишком долго. Завершите её или снимите с себя!\n\n{build_card(t)}")
+                        await bot.send_message(chat_id=t['assignee_id'], text=f"⏳ <b>НАРУШЕНИЕ SLA (> 1 ЧАСА)</b>\nЗадача висит слишком долго. Завершите её или верните в Свободные!\n\n{build_card(t)}")
                         execute_query("UPDATE tickets SET sla_reminded = 1 WHERE id = ?", (t['id'],))
         except Exception: pass
 
-# === БАЗОВЫЕ КОМАНДЫ ===
+# === БАЗОВЫЕ КОМАНДЫ (МЕНЮ ДОЛЖНО ИДТИ ПЕРЕД FSM) ===
 @dp.message(Command("start"), StateFilter('*'))
-@dp.message(F.text == "ℹ️ Помощь", StateFilter('*'))
-async def cmd_help(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Система маршрутизации заявок. Выберите действие в меню.", reply_markup=main_kb)
+    await message.answer("Система маршрутизации заявок готова к работе.\nИспользуйте меню ниже 👇", reply_markup=main_kb)
 
 @dp.message(F.text == "👥 Команда", StateFilter('*'))
 async def cmd_active_users(message: Message, state: FSMContext):
     await state.clear()
-    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_WIP}' ORDER BY assignee")
+    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY assignee", (ST_WIP,))
     if not tickets: return await message.answer("В данный момент ни у кого нет задач в работе.")
     
     users_tasks = {}
@@ -210,11 +209,32 @@ async def cmd_active_users(message: Message, state: FSMContext):
 @dp.message(F.text == "🗄 Архив", StateFilter('*'))
 async def cmd_archive(message: Message, state: FSMContext):
     await state.clear()
-    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_DONE}' ORDER BY id DESC LIMIT 5")
+    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT 5", (ST_DONE,))
     if not tickets: return await message.answer("🗄 Архив пуст.")
     
     await message.answer("🗄 <b>Последние 5 выполненных задач:</b>")
     for t in tickets: await message.answer(build_card(t))
+
+@dp.message(F.text == "📋 Свободные", StateFilter('*'))
+async def list_pool(message: Message, state: FSMContext):
+    await state.clear()
+    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT 10", (ST_NEW,))
+    if not tickets: return await message.answer("📭 Свободных заявок нет.")
+
+    for t in tickets:
+        kb_buttons = [[InlineKeyboardButton(text="✋ Взять в работу", callback_data=f"take_{t['id']}")]]
+        if t['creator_id'] == message.from_user.id:
+            kb_buttons.append([InlineKeyboardButton(text="❌ Отменить заявку", callback_data=f"delete_{t['id']}")])
+        await message.answer(build_card(t), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+
+@dp.message(F.text == "💼 В работе", StateFilter('*'))
+async def list_mine(message: Message, state: FSMContext):
+    await state.clear()
+    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? AND assignee_id = ?", (ST_WIP, message.from_user.id))
+    if not tickets: return await message.answer("💼 У вас нет активных задач.")
+    
+    for t in tickets: 
+        await message.answer(build_card(t), reply_markup=get_action_kb(t['id'], True))
 
 # === ЗАВЕДЕНИЕ ЗАЯВКИ ===
 @dp.message(F.text == "📝 Создать", StateFilter('*'))
@@ -254,39 +274,19 @@ async def ticket_save(callback: CallbackQuery, state: FSMContext):
     
     tid = execute_query(
         "INSERT INTO tickets (ticket_number, client_name, comment, urgency, creator, creator_id, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (t_data['ticket_number'], t_data['client_name'], t_data['comment'], t_data['urgency'], t_data['creator'], callback.from_user.id, t_data['status'])
+        (t_data['ticket_number'], t_data['client_name'], t_data['comment'], t_data['urgency'], t_data['creator'], callback.from_user.id, ST_NEW)
     )
     t_data['id'] = tid
     
     try:
         sent = await bot.send_message(chat_id=GROUP_ID, text=build_card(t_data), reply_markup=get_action_kb(tid, False))
         execute_query("UPDATE tickets SET group_message_id = ? WHERE id = ?", (sent.message_id, tid))
-        res = "✅ Заявка сохранена и доступна в свободных."
+        res = "✅ Заявка сохранена и добавлена в Свободные."
     except Exception as e:
         res = f"✅ Сохранено.\n⚠️ <i>Ошибка отправки в чат: {e}</i>"
     
     with suppress(TelegramBadRequest): await callback.message.edit_text(res)
     await state.clear()
-
-# === СПИСКИ ===
-@dp.message(F.text == "📋 Свободные", StateFilter('*'))
-async def list_pool(message: Message, state: FSMContext):
-    await state.clear()
-    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_NEW}' ORDER BY id DESC LIMIT 10")
-    if not tickets: return await message.answer("📭 Свободных заявок нет.")
-
-    for t in tickets:
-        kb_buttons = [[InlineKeyboardButton(text="✋ Взять", callback_data=f"take_{t['id']}")]]
-        if t['creator_id'] == message.from_user.id:
-            kb_buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"delete_{t['id']}")])
-        await message.answer(build_card(t), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
-
-@dp.message(F.text == "💼 В работе", StateFilter('*'))
-async def list_mine(message: Message, state: FSMContext):
-    await state.clear()
-    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_WIP}' AND assignee_id = ?", (message.from_user.id,))
-    if not tickets: return await message.answer("💼 У вас нет активных задач.")
-    for t in tickets: await message.answer(build_card(t), reply_markup=get_action_kb(t['id'], True))
 
 # === ОБРАБОТЧИКИ КНОПОК ===
 @dp.callback_query(F.data.startswith("take_"))
@@ -296,11 +296,11 @@ async def act_take(callback: CallbackQuery):
     if not t: return await callback.answer("⚠️ Заявка не найдена!", show_alert=True)
     if t[0]["status"] != ST_NEW:
         with suppress(TelegramBadRequest): await callback.message.delete()
-        return await callback.answer("⚠️ Уже в работе!", show_alert=True)
+        return await callback.answer("⚠️ Заявку уже забрал другой сотрудник!", show_alert=True)
 
     uname = get_user_name(callback.from_user)
-    execute_query(f"UPDATE tickets SET status = '{ST_WIP}', assignee = ?, assignee_id = ?, assigned_at = CURRENT_TIMESTAMP, sla_reminded = 0 WHERE id = ?", 
-                  (uname, callback.from_user.id, tid))
+    execute_query("UPDATE tickets SET status = ?, assignee = ?, assignee_id = ?, assigned_at = CURRENT_TIMESTAMP, sla_reminded = 0 WHERE id = ?", 
+                  (ST_WIP, uname, callback.from_user.id, tid))
     
     upd_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))[0]
     is_grp = callback.message.chat.type in ["group", "supergroup"]
@@ -309,7 +309,7 @@ async def act_take(callback: CallbackQuery):
         with suppress(Exception): await bot.edit_message_text(chat_id=GROUP_ID, message_id=upd_t['group_message_id'], text=build_card(upd_t), reply_markup=get_action_kb(tid, True))
 
     if is_grp:
-        await callback.answer("✅ Взято в работу.", show_alert=True)
+        await callback.answer("✅ Взято в работу. Проверьте личные сообщения.", show_alert=True)
     else:
         with suppress(TelegramBadRequest): await callback.message.edit_text(build_card(upd_t), reply_markup=get_action_kb(tid, True))
         await callback.answer("✅ Взято в работу!")
@@ -321,7 +321,7 @@ async def act_close(callback: CallbackQuery):
     if not t: return await callback.answer("⚠️ Заявка не найдена!", show_alert=True)
     if t[0]["assignee_id"] != callback.from_user.id: return await callback.answer("⚠️ Это не ваша заявка!", show_alert=True)
 
-    execute_query(f"UPDATE tickets SET status = '{ST_DONE}' WHERE id = ?", (tid,))
+    execute_query("UPDATE tickets SET status = ? WHERE id = ?", (ST_DONE, tid))
     upd_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))[0]
     is_grp = callback.message.chat.type in ["group", "supergroup"]
     
@@ -330,7 +330,7 @@ async def act_close(callback: CallbackQuery):
 
     if not is_grp:
         with suppress(TelegramBadRequest): await callback.message.edit_text(build_card(upd_t))
-    await callback.answer("✅ Выполнено!")
+    await callback.answer("✅ Задача выполнена и отправлена в Архив!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("delete_"))
 async def act_delete(callback: CallbackQuery):
@@ -338,15 +338,18 @@ async def act_delete(callback: CallbackQuery):
     t = fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))
     if not t: return await callback.answer()
     
-    execute_query(f"UPDATE tickets SET status = '{ST_DEL}' WHERE id = ?", (tid,))
+    if t[0]['creator_id'] != callback.from_user.id:
+        return await callback.answer("⚠️ Только автор может отменить заявку!", show_alert=True)
+        
+    execute_query("UPDATE tickets SET status = ? WHERE id = ?", (ST_DEL, tid))
     
     if t[0]['group_message_id']:
-        with suppress(Exception): await bot.edit_message_text(chat_id=GROUP_ID, message_id=t[0]['group_message_id'], text=f"❌ <b>ОТМЕНЕНА</b>\nЗаявка <code>#{html.escape(t[0]['ticket_number'])}</code> удалена автором.", reply_markup=None)
+        with suppress(Exception): await bot.edit_message_text(chat_id=GROUP_ID, message_id=t[0]['group_message_id'], text=f"❌ <b>ОТМЕНЕНА</b>\nЗаявка <code>#{html.escape(str(t[0]['ticket_number']))}</code> удалена автором.", reply_markup=None)
 
     with suppress(TelegramBadRequest): await callback.message.edit_text("❌ Заявка отменена.")
     await callback.answer()
 
-# === МАГИЯ СНЯТИЯ ЗАДАЧИ ПРЯМО ИЗ ЧАТА ===
+# === МАГИЯ СНЯТИЯ ЗАДАЧИ ===
 @dp.callback_query(F.data.startswith("return_"))
 async def act_return(callback: CallbackQuery, state: FSMContext):
     tid = int(callback.data.split("_")[1])
@@ -357,12 +360,11 @@ async def act_return(callback: CallbackQuery, state: FSMContext):
     is_grp = callback.message.chat.type in ["group", "supergroup"]
 
     if is_grp:
-        # Включаем FSM-состояние для лички прямо из чата!
         user_state = FSMContext(storage=dp.storage, key=StorageKey(bot_id=bot.id, chat_id=callback.from_user.id, user_id=callback.from_user.id))
         await user_state.set_state(ReturnForm.reason)
         await user_state.update_data(ticket_id=tid)
         try:
-            await bot.send_message(callback.from_user.id, f"✍️ <b>Укажите причину снятия с себя заявки <code>#{t[0]['ticket_number']}</code>:</b>\n<i>(Или нажмите любую кнопку в меню для отмены)</i>")
+            await bot.send_message(callback.from_user.id, f"✍️ <b>Напишите причину, по которой снимаете задачу <code>#{t[0]['ticket_number']}</code> с себя:</b>\n<i>(Она будет возвращена в 'Свободные')</i>")
             await callback.answer("Перейдите в личные сообщения с ботом для указания причины!", show_alert=True)
         except Exception:
             await callback.answer("⚠️ ОШИБКА: Сначала запустите бота в личных сообщениях!", show_alert=True)
@@ -370,7 +372,7 @@ async def act_return(callback: CallbackQuery, state: FSMContext):
         with suppress(TelegramBadRequest): await callback.message.delete()
         await state.update_data(ticket_id=tid)
         await state.set_state(ReturnForm.reason)
-        await callback.message.answer("✍️ <b>Укажите причину снятия с себя заявки:</b>")
+        await callback.message.answer("✍️ <b>Напишите причину, по которой снимаете задачу с себя:</b>\n<i>(Она будет возвращена в 'Свободные')</i>")
         await callback.answer()
 
 @dp.message(ReturnForm.reason)
@@ -378,15 +380,15 @@ async def act_return_save(message: Message, state: FSMContext):
     data = await state.get_data()
     tid = data.get("ticket_id")
     
-    # Полностью обнуляем таймеры SLA при возврате
-    execute_query(f"UPDATE tickets SET status = '{ST_NEW}', assignee = NULL, assignee_id = NULL, return_reason = ?, created_at = CURRENT_TIMESTAMP, assigned_at = NULL, alarm_sent = 0, sla_reminded = 0 WHERE id = ?", 
-                  (message.text, tid))
+    # Жесткий сброс всех счетчиков, возврат в пул.
+    execute_query("UPDATE tickets SET status = ?, assignee = NULL, assignee_id = NULL, return_reason = ?, created_at = CURRENT_TIMESTAMP, assigned_at = NULL, alarm_sent = 0, sla_reminded = 0 WHERE id = ?", 
+                  (ST_NEW, message.text[:200], tid))
     
     t = fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))[0]
     if t['group_message_id']:
         with suppress(Exception): await bot.edit_message_text(chat_id=GROUP_ID, message_id=t['group_message_id'], text=build_card(t), reply_markup=get_action_kb(tid, False))
     
-    await message.answer("🔄 Заявка успешно снята и возвращена в пул.", reply_markup=main_kb)
+    await message.answer("🔄 Заявка снята с вас и переведена в статус СВОБОДНА.", reply_markup=main_kb)
     await state.clear()
 
 # === ЗАПУСК ===

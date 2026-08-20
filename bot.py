@@ -13,12 +13,13 @@ logging.basicConfig(level=logging.INFO)
 
 # === ТВОИ ДАННЫЕ ===
 BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
-SENIOR_CHAT_ID = "6516986078"
+# ВАЖНО: ID чата должен начинаться с минуса! Например: "-1001234567890"
+SENIOR_CHAT_ID = "-1003953261901"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# === БАЗА ДАННЫХ (БРОНИРОВАННАЯ) ===
+# === БАЗА ДАННЫХ ===
 def init_db():
     with sqlite3.connect("tickets.db", timeout=20) as conn:
         cursor = conn.cursor()
@@ -67,7 +68,7 @@ def fetch_query(query, params=()):
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
 
-# === FSM СОСТОЯНИЯ ===
+# === СОСТОЯНИЯ ===
 class EscalateForm(StatesGroup):
     ticket_number = State()
     client_name = State()
@@ -77,7 +78,7 @@ class ReturnForm(StatesGroup):
     ticket_id = State()
     reason = State()
 
-# === КОМПАКТНЫЕ МЕНЮ ===
+# === МЕНЮ ===
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Создать"), KeyboardButton(text="📋 Пул")],
@@ -96,9 +97,7 @@ urgency_kb = InlineKeyboardMarkup(inline_keyboard=[
 def get_user_name(user):
     return f"@{user.username}" if user.username else user.first_name
 
-# === ГЕНЕРАТОР КРАСИВЫХ КАРТОЧЕК ===
 def build_card(t):
-    """Формирует компактную и красивую карточку заявки"""
     status_icon = "🆕" if t['status'] == "🔴 НОВАЯ" else "⏳" if t['status'] == "🟡 В РАБОТЕ" else "✅"
     assignee = t['assignee'] if t['assignee'] else "⏳ Ожидает"
     reason = f"\n⚠️ <b>Причина возврата:</b> <i>{t['return_reason']}</i>" if t['return_reason'] else ""
@@ -115,7 +114,15 @@ def build_card(t):
         f"🛠 <b>Взял:</b> {assignee}"
     )
 
-# === ФОНОВЫЙ МОНИТОРИНГ (SLA И ТРЕВОГИ) ===
+# === ФУНКЦИЯ ОТПРАВКИ УВЕДОМЛЕНИЙ В ГРУППУ ===
+async def notify_group(text):
+    """Отправляет лог действия в общий чат"""
+    try:
+        await bot.send_message(chat_id=SENIOR_CHAT_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение в группу {SENIOR_CHAT_ID}. Ошибка: {e}")
+
+# === ФОНОВЫЙ МОНИТОРИНГ ===
 async def monitor_tasks(bot: Bot):
     while True:
         await asyncio.sleep(60)
@@ -123,9 +130,8 @@ async def monitor_tasks(bot: Bot):
             alarm_tickets = fetch_query("SELECT * FROM tickets WHERE status = '🔴 НОВАЯ' AND urgency = '🔴 Высокая' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')")
             for t in alarm_tickets:
                 msg = f"🔥 <b>АЛАРМ! ЗАЯВКА ГОРИТ!</b>\nНикто не берет важную задачу!\n\n" + build_card(t)
-                with suppress(Exception):
-                    await bot.send_message(chat_id=SENIOR_CHAT_ID, text=msg, parse_mode="HTML")
-                    execute_query("UPDATE tickets SET alarm_sent = 1 WHERE id = ?", (t['id'],))
+                await notify_group(msg)
+                execute_query("UPDATE tickets SET alarm_sent = 1 WHERE id = ?", (t['id'],))
 
             sla_tickets = fetch_query("SELECT * FROM tickets WHERE status = '🟡 В РАБОТЕ' AND sla_reminded = 0 AND assigned_at <= datetime('now', '-2 hours')")
             for t in sla_tickets:
@@ -218,8 +224,8 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
         (t_data['ticket_number'], t_data['client_name'], t_data['comment'], t_data['urgency'], t_data['creator'], callback.from_user.id, t_data['status'])
     )
 
-    with suppress(Exception):
-        await bot.send_message(chat_id=SENIOR_CHAT_ID, text=f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n{build_card(t_data)}", parse_mode="HTML")
+    # УВЕДОМЛЕНИЕ О СОЗДАНИИ В ГРУППУ
+    await notify_group(f"🔔 <b>НОВАЯ ЗАЯВКА В ПУЛЕ</b>\n\n{build_card(t_data)}")
     
     with suppress(TelegramBadRequest):
         await callback.message.edit_text("✅ Заявка улетела в пул!")
@@ -277,11 +283,15 @@ async def handle_take_task(callback: CallbackQuery):
             await callback.message.delete()
         return
 
+    user_name = get_user_name(callback.from_user)
     execute_query("UPDATE tickets SET status = '🟡 В РАБОТЕ', assignee = ?, assignee_id = ?, assigned_at = CURRENT_TIMESTAMP, sla_reminded = 0 WHERE id = ?", 
-                  (get_user_name(callback.from_user), callback.from_user.id, ticket_id))
+                  (user_name, callback.from_user.id, ticket_id))
 
     updated_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))[0]
     
+    # УВЕДОМЛЕНИЕ О ВЗЯТИИ В ГРУППУ
+    await notify_group(f"🟡 <b>ЗАДАЧА В РАБОТЕ</b>\nЗаявку <b>№{updated_t['ticket_number']}</b> взял {user_name}")
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Завершить", callback_data=f"close_{ticket_id}")],
         [InlineKeyboardButton(text="🔄 Вернуть в пул", callback_data=f"return_{ticket_id}")]
@@ -302,6 +312,9 @@ async def close_task(callback: CallbackQuery):
     execute_query("UPDATE tickets SET status = '✅ РЕШЕНА' WHERE id = ?", (ticket_id,))
     updated_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))[0]
     
+    # УВЕДОМЛЕНИЕ О ЗАКРЫТИИ В ГРУППУ
+    await notify_group(f"✅ <b>ЗАДАЧА РЕШЕНА</b>\nЗаявку <b>№{updated_t['ticket_number']}</b> успешно закрыл {updated_t['assignee']}")
+
     with suppress(TelegramBadRequest):
         await callback.message.edit_text(build_card(updated_t), parse_mode="HTML")
     await callback.answer("🚀 Задача решена!", show_alert=True)
@@ -309,7 +322,14 @@ async def close_task(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("delete_"))
 async def delete_task(callback: CallbackQuery):
     ticket_id = int(callback.data.split("_")[1])
+    t_data = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
+    
     execute_query("UPDATE tickets SET status = '❌ УДАЛЕНА' WHERE id = ?", (ticket_id,))
+    
+    # УВЕДОМЛЕНИЕ ОБ УДАЛЕНИИ
+    if t_data:
+        await notify_group(f"❌ <b>ЗАЯВКА УДАЛЕНА</b>\nЗаявка <b>№{t_data[0]['ticket_number']}</b> была отменена создателем.")
+
     with suppress(TelegramBadRequest):
         await callback.message.edit_text("❌ <i>Заявка удалена.</i>", parse_mode="HTML")
     await callback.answer("Удалено.")
@@ -330,11 +350,16 @@ async def return_task_start(callback: CallbackQuery, state: FSMContext):
 async def process_return_reason(message: Message, state: FSMContext):
     data = await state.get_data()
     ticket_id = data.get("ticket_id")
+    t_data = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
     
     execute_query(
         "UPDATE tickets SET status = '🔴 НОВАЯ', assignee = NULL, assignee_id = NULL, return_reason = ?, created_at = CURRENT_TIMESTAMP, alarm_sent = 0 WHERE id = ?", 
         (message.text, ticket_id)
     )
+    
+    # УВЕДОМЛЕНИЕ О ВОЗВРАТЕ В ГРУППУ
+    if t_data:
+        await notify_group(f"🔄 <b>ЗАДАЧА ВЕРНУЛАСЬ В ПУЛ</b>\nЗаявку <b>№{t_data[0]['ticket_number']}</b> вернули.\n⚠️ Причина: <i>{message.text}</i>")
     
     await message.answer("🔄 <i>Заявка возвращена в пул.</i>", parse_mode="HTML", reply_markup=main_menu_kb)
     await state.clear()
@@ -342,7 +367,7 @@ async def process_return_reason(message: Message, state: FSMContext):
 async def main():
     init_db()
     asyncio.create_task(monitor_tasks(bot))
-    print("Ультимативная CRM запущена!")
+    print("Ультимативная CRM с трансляциями запущена!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

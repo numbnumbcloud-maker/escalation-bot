@@ -67,6 +67,7 @@ def fetch_query(query, params=()):
 
 # === ХЕЛПЕР ВРЕМЕНИ ===
 def get_elapsed_time(assigned_at_str):
+    """Высчитывает, сколько времени задача находится в работе"""
     if not assigned_at_str: return "—"
     try:
         assigned_dt = datetime.strptime(assigned_at_str, '%Y-%m-%d %H:%M:%S')
@@ -92,9 +93,8 @@ class ReturnForm(StatesGroup):
 # === UI / МЕНЮ ===
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📝 Создать"), KeyboardButton(text="📋 Свободные")],
-        [KeyboardButton(text="💼 В работе"), KeyboardButton(text="👥 Команда")],
-        [KeyboardButton(text="🗄 Архив")]
+        [KeyboardButton(text="📝 Создать"), KeyboardButton(text="📋 Свободные"), KeyboardButton(text="💼 В работе")],
+        [KeyboardButton(text="👥 Команда"), KeyboardButton(text="🗄 Архив")]
     ],
     resize_keyboard=True
 )
@@ -109,8 +109,9 @@ def get_user_name(user):
     return f"@{user.username}" if user.username else user.first_name
 
 def build_card(t):
+    """Строгий дизайн карточки"""
     assignee = html.escape(str(t['assignee'])) if t['assignee'] else "—"
-    reason = f"\n⚠️ <b>Возврат:</b> <i>{html.escape(str(t['return_reason']))}</i>" if t['return_reason'] else ""
+    reason = f"\n⚠️ <b>Причина возврата:</b> <i>{html.escape(str(t['return_reason']))}</i>" if t['return_reason'] else ""
     note = f"\n💡 <b>Ремарка:</b> <i>{html.escape(str(t['senior_note']))}</i>" if t['senior_note'] else ""
     
     time_info = ""
@@ -129,7 +130,7 @@ def build_card(t):
     )
 
 def get_action_kb(t_id, is_wip=False):
-    """Умная генерация кнопок с защитой от мисскликов (на разных строках)"""
+    """Генерирует нужные кнопки для карточки"""
     if not is_wip:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✋ Взять в работу", callback_data=f"take_{t_id}")]
@@ -139,7 +140,7 @@ def get_action_kb(t_id, is_wip=False):
         [InlineKeyboardButton(text="🔄 Снять с себя", callback_data=f"return_{t_id}")]
     ])
 
-# === СМАРТ-РЕПЛАИ (ЗАМЕТКИ СТАРШИХ В ЧАТЕ) ===
+# === СМАРТ-РЕПЛАИ (ЗАМЕТКИ В ЧАТЕ) ===
 @dp.message(F.reply_to_message & F.chat.type.in_({"group", "supergroup"}))
 async def handle_smart_reply(message: Message):
     if message.reply_to_message.from_user.is_bot:
@@ -164,8 +165,8 @@ async def monitor_tasks():
     while True:
         await asyncio.sleep(60)
         try:
-            # Тревога (Аларм 15 минут в пуле)
-            alarm_tickets = fetch_query("SELECT * FROM tickets WHERE status = ? AND urgency = '🔴 Высокий' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')", (ST_NEW,))
+            # Тревога пула (15 минут)
+            alarm_tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_NEW}' AND urgency = '🔴 Высокий' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')")
             for t in alarm_tickets:
                 try:
                     sent_msg = await bot.send_message(chat_id=GROUP_ID, text=f"🚨 <b>СЕРЬЕЗНОЕ ОЖИДАНИЕ!</b>\nНикто не берет важную задачу!\n\n{build_card(t)}", reply_markup=get_action_kb(t['id'], False))
@@ -174,16 +175,16 @@ async def monitor_tasks():
                         with suppress(Exception): await bot.delete_message(chat_id=GROUP_ID, message_id=t['group_message_id'])
                 except Exception: pass
 
-            # Напоминание исполнителю (1 час)
-            sla_tickets = fetch_query("SELECT * FROM tickets WHERE status = ? AND sla_reminded = 0 AND assigned_at <= datetime('now', '-1 hour')", (ST_WIP,))
+            # SLA Напоминание (1 час)
+            sla_tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_WIP}' AND sla_reminded = 0 AND assigned_at <= datetime('now', '-1 hour')")
             for t in sla_tickets:
                 if t['assignee_id']:
                     with suppress(Exception):
-                        await bot.send_message(chat_id=t['assignee_id'], text=f"⏳ <b>НАРУШЕНИЕ SLA (> 1 ЧАСА)</b>\nЗадача висит слишком долго. Завершите её или верните в Свободные!\n\n{build_card(t)}")
+                        await bot.send_message(chat_id=t['assignee_id'], text=f"⏳ <b>НАРУШЕНИЕ SLA (> 1 ЧАСА)</b>\nЗадача висит слишком долго. Завершите её или снимите с себя!\n\n{build_card(t)}")
                         execute_query("UPDATE tickets SET sla_reminded = 1 WHERE id = ?", (t['id'],))
         except Exception: pass
 
-# === БАЗОВЫЕ КОМАНДЫ (МЕНЮ ДОЛЖНО ИДТИ ПЕРЕД FSM) ===
+# === БАЗОВЫЕ КОМАНДЫ ===
 @dp.message(Command("start"), StateFilter('*'))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -192,7 +193,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.message(F.text == "👥 Команда", StateFilter('*'))
 async def cmd_active_users(message: Message, state: FSMContext):
     await state.clear()
-    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY assignee", (ST_WIP,))
+    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_WIP}' ORDER BY assignee")
     if not tickets: return await message.answer("В данный момент ни у кого нет задач в работе.")
     
     users_tasks = {}
@@ -209,7 +210,7 @@ async def cmd_active_users(message: Message, state: FSMContext):
 @dp.message(F.text == "🗄 Архив", StateFilter('*'))
 async def cmd_archive(message: Message, state: FSMContext):
     await state.clear()
-    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT 5", (ST_DONE,))
+    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_DONE}' ORDER BY id DESC LIMIT 5")
     if not tickets: return await message.answer("🗄 Архив пуст.")
     
     await message.answer("🗄 <b>Последние 5 выполненных задач:</b>")
@@ -218,7 +219,7 @@ async def cmd_archive(message: Message, state: FSMContext):
 @dp.message(F.text == "📋 Свободные", StateFilter('*'))
 async def list_pool(message: Message, state: FSMContext):
     await state.clear()
-    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT 10", (ST_NEW,))
+    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_NEW}' ORDER BY id DESC LIMIT 10")
     if not tickets: return await message.answer("📭 Свободных заявок нет.")
 
     for t in tickets:
@@ -230,7 +231,7 @@ async def list_pool(message: Message, state: FSMContext):
 @dp.message(F.text == "💼 В работе", StateFilter('*'))
 async def list_mine(message: Message, state: FSMContext):
     await state.clear()
-    tickets = fetch_query("SELECT * FROM tickets WHERE status = ? AND assignee_id = ?", (ST_WIP, message.from_user.id))
+    tickets = fetch_query(f"SELECT * FROM tickets WHERE status = '{ST_WIP}' AND assignee_id = ?", (message.from_user.id,))
     if not tickets: return await message.answer("💼 У вас нет активных задач.")
     
     for t in tickets: 
@@ -293,9 +294,14 @@ async def ticket_save(callback: CallbackQuery, state: FSMContext):
 async def act_take(callback: CallbackQuery):
     tid = int(callback.data.split("_")[1])
     t = fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))
-    if not t: return await callback.answer("⚠️ Заявка не найдена!", show_alert=True)
-    if t[0]["status"] != ST_NEW:
-        with suppress(TelegramBadRequest): await callback.message.delete()
+    
+    if not t: return await callback.answer("⚠️ Заявка не найдена в базе!", show_alert=True)
+    
+    if t[0]["status"] == ST_DEL:
+        with suppress(TelegramBadRequest): await callback.message.edit_reply_markup(reply_markup=None)
+        return await callback.answer("⚠️ Заявка была отменена автором!", show_alert=True)
+    elif t[0]["status"] != ST_NEW:
+        with suppress(TelegramBadRequest): await callback.message.edit_reply_markup(reply_markup=None)
         return await callback.answer("⚠️ Заявку уже забрал другой сотрудник!", show_alert=True)
 
     uname = get_user_name(callback.from_user)
@@ -318,6 +324,7 @@ async def act_take(callback: CallbackQuery):
 async def act_close(callback: CallbackQuery):
     tid = int(callback.data.split("_")[1])
     t = fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))
+    
     if not t: return await callback.answer("⚠️ Заявка не найдена!", show_alert=True)
     if t[0]["assignee_id"] != callback.from_user.id: return await callback.answer("⚠️ Это не ваша заявка!", show_alert=True)
 
@@ -329,7 +336,7 @@ async def act_close(callback: CallbackQuery):
         with suppress(Exception): await bot.edit_message_text(chat_id=GROUP_ID, message_id=upd_t['group_message_id'], text=build_card(upd_t), reply_markup=None)
 
     if not is_grp:
-        with suppress(TelegramBadRequest): await callback.message.edit_text(build_card(upd_t))
+        with suppress(TelegramBadRequest): await callback.message.edit_text(build_card(upd_t), reply_markup=None)
     await callback.answer("✅ Задача выполнена и отправлена в Архив!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("delete_"))
@@ -346,7 +353,7 @@ async def act_delete(callback: CallbackQuery):
     if t[0]['group_message_id']:
         with suppress(Exception): await bot.edit_message_text(chat_id=GROUP_ID, message_id=t[0]['group_message_id'], text=f"❌ <b>ОТМЕНЕНА</b>\nЗаявка <code>#{html.escape(str(t[0]['ticket_number']))}</code> удалена автором.", reply_markup=None)
 
-    with suppress(TelegramBadRequest): await callback.message.edit_text("❌ Заявка отменена.")
+    with suppress(TelegramBadRequest): await callback.message.edit_text("❌ Заявка отменена.", reply_markup=None)
     await callback.answer()
 
 # === МАГИЯ СНЯТИЯ ЗАДАЧИ ===
@@ -369,7 +376,8 @@ async def act_return(callback: CallbackQuery, state: FSMContext):
         except Exception:
             await callback.answer("⚠️ ОШИБКА: Сначала запустите бота в личных сообщениях!", show_alert=True)
     else:
-        with suppress(TelegramBadRequest): await callback.message.delete()
+        # Теперь не удаляем, а просто убираем кнопки, чтобы не было ошибки клиента Telegram
+        with suppress(TelegramBadRequest): await callback.message.edit_reply_markup(reply_markup=None)
         await state.update_data(ticket_id=tid)
         await state.set_state(ReturnForm.reason)
         await callback.message.answer("✍️ <b>Напишите причину, по которой снимаете задачу с себя:</b>\n<i>(Она будет возвращена в 'Свободные')</i>")
@@ -380,15 +388,19 @@ async def act_return_save(message: Message, state: FSMContext):
     data = await state.get_data()
     tid = data.get("ticket_id")
     
+    # Защита: если прислали стикер, фото и т.д.
+    reason_text = message.text[:200] if message.text else "Указана медиа-причина"
+    
     # Жесткий сброс всех счетчиков, возврат в пул.
     execute_query("UPDATE tickets SET status = ?, assignee = NULL, assignee_id = NULL, return_reason = ?, created_at = CURRENT_TIMESTAMP, assigned_at = NULL, alarm_sent = 0, sla_reminded = 0 WHERE id = ?", 
-                  (ST_NEW, message.text[:200], tid))
+                  (ST_NEW, reason_text, tid))
     
     t = fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))[0]
+    
     if t['group_message_id']:
         with suppress(Exception): await bot.edit_message_text(chat_id=GROUP_ID, message_id=t['group_message_id'], text=build_card(t), reply_markup=get_action_kb(tid, False))
     
-    await message.answer("🔄 Заявка снята с вас и переведена в статус СВОБОДНА.", reply_markup=main_kb)
+    await message.answer("🔄 Заявка успешно снята и возвращена в пул.", reply_markup=main_kb)
     await state.clear()
 
 # === ЗАПУСК ===

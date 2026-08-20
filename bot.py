@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sqlite3
+import html
 from contextlib import suppress
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -13,8 +14,8 @@ logging.basicConfig(level=logging.INFO)
 
 # === ТВОИ ДАННЫЕ ===
 BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
-# ВАЖНО: ID чата должен начинаться с минуса! Например: "-1001234567890"
-SENIOR_CHAT_ID = "-1003953261901"
+# ВАЖНО: Укажи ID чата БЕЗ КАВЫЧЕК, как обычное число с минусом!
+SENIOR_CHAT_ID = -1003953261901 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -97,30 +98,33 @@ urgency_kb = InlineKeyboardMarkup(inline_keyboard=[
 def get_user_name(user):
     return f"@{user.username}" if user.username else user.first_name
 
+# БРОНИРОВАННЫЙ БИЛДЕР КАРТОЧЕК (С защитой от плохих символов)
 def build_card(t):
     status_icon = "🆕" if t['status'] == "🔴 НОВАЯ" else "⏳" if t['status'] == "🟡 В РАБОТЕ" else "✅"
-    assignee = t['assignee'] if t['assignee'] else "⏳ Ожидает"
-    reason = f"\n⚠️ <b>Причина возврата:</b> <i>{t['return_reason']}</i>" if t['return_reason'] else ""
+    assignee = html.escape(str(t['assignee'])) if t['assignee'] else "⏳ Ожидает"
+    reason_text = html.escape(str(t['return_reason'])) if t['return_reason'] else ""
+    reason = f"\n⚠️ <b>Причина возврата:</b> <i>{reason_text}</i>" if reason_text else ""
     
     return (
         f"{status_icon} <b>{t['status']}</b>\n"
         f"➖➖➖➖➖➖➖➖\n"
-        f"🆔 <b>№:</b> {t['ticket_number']}\n"
-        f"👤 <b>Клиент:</b> {t['client_name']}\n"
+        f"🆔 <b>№:</b> {html.escape(str(t['ticket_number']))}\n"
+        f"👤 <b>Клиент:</b> {html.escape(str(t['client_name']))}\n"
         f"⚡ <b>Срочность:</b> {t['urgency']}\n"
-        f"💬 <b>Суть:</b> {t['comment']}{reason}\n"
+        f"💬 <b>Суть:</b> {html.escape(str(t['comment']))}{reason}\n"
         f"➖➖➖➖➖➖➖➖\n"
-        f"✍️ <b>Автор:</b> {t['creator']}\n"
+        f"✍️ <b>Автор:</b> {html.escape(str(t['creator']))}\n"
         f"🛠 <b>Взял:</b> {assignee}"
     )
 
-# === ФУНКЦИЯ ОТПРАВКИ УВЕДОМЛЕНИЙ В ГРУППУ ===
+# === СИСТЕМА УВЕДОМЛЕНИЙ С ВОЗВРАТОМ ОШИБОК ===
 async def notify_group(text):
-    """Отправляет лог действия в общий чат"""
     try:
-        await bot.send_message(chat_id=SENIOR_CHAT_ID, text=text, parse_mode="HTML")
+        chat_id = int(SENIOR_CHAT_ID) if str(SENIOR_CHAT_ID).lstrip('-').isdigit() else SENIOR_CHAT_ID
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        return True, ""
     except Exception as e:
-        logging.error(f"Не удалось отправить сообщение в группу {SENIOR_CHAT_ID}. Ошибка: {e}")
+        return False, str(e)
 
 # === ФОНОВЫЙ МОНИТОРИНГ ===
 async def monitor_tasks(bot: Bot):
@@ -224,11 +228,16 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
         (t_data['ticket_number'], t_data['client_name'], t_data['comment'], t_data['urgency'], t_data['creator'], callback.from_user.id, t_data['status'])
     )
 
-    # УВЕДОМЛЕНИЕ О СОЗДАНИИ В ГРУППУ
-    await notify_group(f"🔔 <b>НОВАЯ ЗАЯВКА В ПУЛЕ</b>\n\n{build_card(t_data)}")
+    # ОТПРАВЛЯЕМ В ГРУППУ И ЛОВИМ ОШИБКУ
+    success, err_msg = await notify_group(f"🔔 <b>НОВАЯ ЗАЯВКА В ПУЛЕ</b>\n\n{build_card(t_data)}")
     
+    if success:
+        response_text = "✅ Заявка создана и отправлена в группу!"
+    else:
+        response_text = f"✅ Заявка создана, НО в группу не отправлена.\n⚠️ <b>Системная ошибка:</b> <code>{err_msg}</code>\n<i>(Перешли этот текст разработчику!)</i>"
+
     with suppress(TelegramBadRequest):
-        await callback.message.edit_text("✅ Заявка улетела в пул!")
+        await callback.message.edit_text(response_text, parse_mode="HTML")
     await state.clear()
 
 # === ПУЛ ЗАЯВОК ===
@@ -289,8 +298,7 @@ async def handle_take_task(callback: CallbackQuery):
 
     updated_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))[0]
     
-    # УВЕДОМЛЕНИЕ О ВЗЯТИИ В ГРУППУ
-    await notify_group(f"🟡 <b>ЗАДАЧА В РАБОТЕ</b>\nЗаявку <b>№{updated_t['ticket_number']}</b> взял {user_name}")
+    await notify_group(f"🟡 <b>ЗАДАЧА В РАБОТЕ</b>\nЗаявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> взял {user_name}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Завершить", callback_data=f"close_{ticket_id}")],
@@ -312,8 +320,7 @@ async def close_task(callback: CallbackQuery):
     execute_query("UPDATE tickets SET status = '✅ РЕШЕНА' WHERE id = ?", (ticket_id,))
     updated_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))[0]
     
-    # УВЕДОМЛЕНИЕ О ЗАКРЫТИИ В ГРУППУ
-    await notify_group(f"✅ <b>ЗАДАЧА РЕШЕНА</b>\nЗаявку <b>№{updated_t['ticket_number']}</b> успешно закрыл {updated_t['assignee']}")
+    await notify_group(f"✅ <b>ЗАДАЧА РЕШЕНА</b>\nЗаявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> успешно закрыл {updated_t['assignee']}")
 
     with suppress(TelegramBadRequest):
         await callback.message.edit_text(build_card(updated_t), parse_mode="HTML")
@@ -326,9 +333,8 @@ async def delete_task(callback: CallbackQuery):
     
     execute_query("UPDATE tickets SET status = '❌ УДАЛЕНА' WHERE id = ?", (ticket_id,))
     
-    # УВЕДОМЛЕНИЕ ОБ УДАЛЕНИИ
     if t_data:
-        await notify_group(f"❌ <b>ЗАЯВКА УДАЛЕНА</b>\nЗаявка <b>№{t_data[0]['ticket_number']}</b> была отменена создателем.")
+        await notify_group(f"❌ <b>ЗАЯВКА УДАЛЕНА</b>\nЗаявка <b>№{html.escape(str(t_data[0]['ticket_number']))}</b> отменена создателем.")
 
     with suppress(TelegramBadRequest):
         await callback.message.edit_text("❌ <i>Заявка удалена.</i>", parse_mode="HTML")
@@ -357,9 +363,8 @@ async def process_return_reason(message: Message, state: FSMContext):
         (message.text, ticket_id)
     )
     
-    # УВЕДОМЛЕНИЕ О ВОЗВРАТЕ В ГРУППУ
     if t_data:
-        await notify_group(f"🔄 <b>ЗАДАЧА ВЕРНУЛАСЬ В ПУЛ</b>\nЗаявку <b>№{t_data[0]['ticket_number']}</b> вернули.\n⚠️ Причина: <i>{message.text}</i>")
+        await notify_group(f"🔄 <b>ЗАДАЧА ВЕРНУЛАСЬ В ПУЛ</b>\nЗаявку <b>№{html.escape(str(t_data[0]['ticket_number']))}</b> вернули.\n⚠️ Причина: <i>{html.escape(str(message.text))}</i>")
     
     await message.answer("🔄 <i>Заявка возвращена в пул.</i>", parse_mode="HTML", reply_markup=main_menu_kb)
     await state.clear()
@@ -367,7 +372,7 @@ async def process_return_reason(message: Message, state: FSMContext):
 async def main():
     init_db()
     asyncio.create_task(monitor_tasks(bot))
-    print("Ультимативная CRM с трансляциями запущена!")
+    print("Ультимативная CRM с умными логами запущена!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

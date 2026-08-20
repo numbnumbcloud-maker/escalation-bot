@@ -2,7 +2,6 @@ import asyncio
 import logging
 import sqlite3
 import html
-import os
 from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F
@@ -14,14 +13,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 
-# === НАСТРОЙКИ ===
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Вставь сюда свои данные
+# === ТВОИ ДАННЫЕ ===
 BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
-SENIOR_CHAT_ID = -1004340807494  # Строго без кавычек, просто число с минусом!
+SENIOR_CHAT_ID = -1004340807494  # Строго без кавычек, число с минусом
 
-# Инициализация бота с глобальным HTML
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
@@ -48,17 +45,14 @@ def init_db():
                 alarm_sent INTEGER DEFAULT 0
             )
         ''')
-        # Автоматическая миграция новых колонок
         columns = [
             ("creator_id", "INTEGER"), ("assignee_id", "INTEGER"), 
             ("return_reason", "TEXT"), ("assigned_at", "TIMESTAMP"), 
             ("sla_reminded", "INTEGER DEFAULT 0"), ("alarm_sent", "INTEGER DEFAULT 0")
         ]
         for col, dtype in columns:
-            try:
+            with suppress(sqlite3.OperationalError):
                 cursor.execute(f"ALTER TABLE tickets ADD COLUMN {col} {dtype}")
-            except sqlite3.OperationalError:
-                pass
         conn.commit()
 
 def execute_query(query, params=()):
@@ -105,7 +99,6 @@ def get_user_name(user):
     return f"@{user.username}" if user.username else user.first_name
 
 def build_card(t):
-    """Генератор неуязвимых HTML-карточек"""
     status_icon = "🆕" if t['status'] == "🔴 НОВАЯ" else "⏳" if t['status'] == "🟡 В РАБОТЕ" else "✅"
     assignee = html.escape(str(t['assignee'])) if t['assignee'] else "⏳ Ожидает"
     
@@ -124,13 +117,13 @@ def build_card(t):
         f"🛠 <b>Взял:</b> {assignee}"
     )
 
-# === СИСТЕМА УВЕДОМЛЕНИЙ В ГРУППУ ===
-async def notify_group(text):
+# === СИСТЕМА ИНТЕРАКТИВНЫХ УВЕДОМЛЕНИЙ В ГРУППУ ===
+async def notify_group(text, reply_markup=None):
     try:
-        await bot.send_message(chat_id=SENIOR_CHAT_ID, text=text)
+        await bot.send_message(chat_id=SENIOR_CHAT_ID, text=text, reply_markup=reply_markup)
         return True, ""
     except Exception as e:
-        logging.error(f"Ошибка уведомления в группу: {e}")
+        logging.error(f"Ошибка уведомления: {e}")
         return False, str(e)
 
 # === ФОНОВЫЕ ПРОЦЕССЫ (SLA И АЛАРМЫ) ===
@@ -141,7 +134,9 @@ async def monitor_tasks():
             # Аларм: Важные задачи лежат более 15 минут
             alarm_tickets = fetch_query("SELECT * FROM tickets WHERE status = '🔴 НОВАЯ' AND urgency = '🔴 Высокая' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')")
             for t in alarm_tickets:
-                await notify_group(f"🔥 <b>АЛАРМ! ЗАЯВКА ГОРИТ!</b>\nНикто не берет важную задачу!\n\n{build_card(t)}")
+                # Кнопка прямо в аларме!
+                chat_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Спасти задачу (Взять)", callback_data=f"take_{t['id']}")]])
+                await notify_group(f"🔥 <b>АЛАРМ! ЗАЯВКА ГОРИТ!</b>\nНикто не берет важную задачу!\n\n{build_card(t)}", reply_markup=chat_kb)
                 execute_query("UPDATE tickets SET alarm_sent = 1 WHERE id = ?", (t['id'],))
 
             # SLA: Задачи в работе более 2 часов
@@ -230,12 +225,20 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
         "return_reason": None
     }
     
-    execute_query(
+    # Сохраняем в БД и получаем ID новой задачи
+    ticket_id = execute_query(
         "INSERT INTO tickets (ticket_number, client_name, comment, urgency, creator, creator_id, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (t_data['ticket_number'], t_data['client_name'], t_data['comment'], t_data['urgency'], t_data['creator'], callback.from_user.id, t_data['status'])
     )
 
-    success, err = await notify_group(f"🔔 <b>НОВАЯ ЗАЯВКА В ПУЛЕ</b>\n\n{build_card(t_data)}")
+    t_data['id'] = ticket_id # Добавляем ID в словарь для карточки
+
+    # Формируем кнопку для отправки в группу
+    group_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✋ Взять в работу", callback_data=f"take_{ticket_id}")]
+    ])
+
+    success, err = await notify_group(f"🔔 <b>НОВАЯ ЗАЯВКА В ПУЛЕ</b>\n\n{build_card(t_data)}", reply_markup=group_kb)
     
     res_text = "✅ Заявка улетела в пул!" if success else f"✅ Заявка создана!\n⚠️ <i>Ошибка отправки в группу: {err}</i>"
     
@@ -281,7 +284,7 @@ async def show_my_tasks(message: Message, state: FSMContext):
         ])
         await message.answer(build_card(t), reply_markup=kb)
 
-# === ДЕЙСТВИЯ С ЗАЯВКАМИ ===
+# === ДЕЙСТВИЯ (ИНТЕРАКТИВНЫЕ КНОПКИ) ===
 @dp.callback_query(F.data.startswith("take_"))
 async def handle_take_task(callback: CallbackQuery):
     ticket_id = int(callback.data.split("_")[1])
@@ -298,16 +301,33 @@ async def handle_take_task(callback: CallbackQuery):
 
     updated_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))[0]
     
-    await notify_group(f"🟡 <b>ЗАДАЧА В РАБОТЕ</b>\nЗаявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> взял {user_name}")
+    # ПРОВЕРЯЕМ, ГДЕ БЫЛА НАЖАТА КНОПКА (В ГРУППЕ ИЛИ В ЛИЧКЕ)
+    is_group = callback.message.chat.type in ["group", "supergroup"]
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Завершить", callback_data=f"close_{ticket_id}")],
-        [InlineKeyboardButton(text="🔄 Вернуть в пул", callback_data=f"return_{ticket_id}")]
-    ])
-    
-    with suppress(TelegramBadRequest):
-        await callback.message.edit_text(build_card(updated_t), reply_markup=kb)
-    await callback.answer("✅ Взято в работу!")
+    if is_group:
+        # Если нажали в группе -> Обновляем сообщение в группе + кнопка "Завершить"
+        group_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Завершить", callback_data=f"close_{ticket_id}")]
+        ])
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text(f"🟡 <b>ЗАДАЧА В РАБОТЕ</b>\n\n{build_card(updated_t)}", reply_markup=group_kb)
+        
+        await callback.answer("✅ Вы взяли задачу! Можете управлять ей в личке с ботом.", show_alert=True)
+        
+        # Дублируем уведомление в личку специалисту
+        with suppress(Exception):
+            await bot.send_message(chat_id=callback.from_user.id, text=f"✅ Вы забрали заявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> из чата!\nОна добавлена в ваши задачи.")
+    else:
+        # Если нажали в личке (Пул) -> Обновляем личку + уведомляем группу (без кнопок)
+        await notify_group(f"🟡 <b>ЗАДАЧА В РАБОТЕ</b>\nЗаявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> взял {user_name}\n\n{build_card(updated_t)}")
+        
+        private_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Завершить", callback_data=f"close_{ticket_id}")],
+            [InlineKeyboardButton(text="🔄 Вернуть в пул", callback_data=f"return_{ticket_id}")]
+        ])
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text(build_card(updated_t), reply_markup=private_kb)
+        await callback.answer("✅ Взято в работу!")
 
 @dp.callback_query(F.data.startswith("close_"))
 async def close_task(callback: CallbackQuery):
@@ -315,16 +335,24 @@ async def close_task(callback: CallbackQuery):
     t_data = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
     
     if not t_data or t_data[0]["assignee_id"] != callback.from_user.id:
-        return await callback.answer("⚠️ Вы не можете закрыть эту заявку!", show_alert=True)
+        return await callback.answer("⚠️ Вы не можете закрыть чужую заявку!", show_alert=True)
 
     execute_query("UPDATE tickets SET status = '✅ РЕШЕНА' WHERE id = ?", (ticket_id,))
     updated_t = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))[0]
     
-    await notify_group(f"✅ <b>ЗАДАЧА РЕШЕНА</b>\nЗаявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> успешно закрыл {updated_t['assignee']}")
-
-    with suppress(TelegramBadRequest):
-        await callback.message.edit_text(build_card(updated_t))
-    await callback.answer("🚀 Задача решена!", show_alert=True)
+    is_group = callback.message.chat.type in ["group", "supergroup"]
+    
+    if is_group:
+        # Если закрыли прямо из группы
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text(f"✅ <b>ЗАДАЧА РЕШЕНА</b>\n\n{build_card(updated_t)}")
+        await callback.answer("🚀 Задача успешно решена!", show_alert=True)
+    else:
+        # Если закрыли из лички
+        await notify_group(f"✅ <b>ЗАДАЧА РЕШЕНА</b>\nЗаявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> закрыл {updated_t['assignee']}\n\n{build_card(updated_t)}")
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_text(build_card(updated_t))
+        await callback.answer("🚀 Задача решена!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("delete_"))
 async def delete_task(callback: CallbackQuery):
@@ -364,7 +392,10 @@ async def process_return_reason(message: Message, state: FSMContext):
     )
     
     if t_data:
-        await notify_group(f"🔄 <b>ЗАДАЧА ВЕРНУЛАСЬ В ПУЛ</b>\nЗаявку <b>№{html.escape(str(t_data[0]['ticket_number']))}</b> вернули.\n⚠️ Причина: <i>{html.escape(str(message.text))}</i>")
+        # Уведомляем группу о возврате + снова вешаем кнопку "Взять"
+        return_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Взять в работу", callback_data=f"take_{ticket_id}")]])
+        msg_text = f"🔄 <b>ЗАДАЧА ВЕРНУЛАСЬ В ПУЛ</b>\nЗаявку <b>№{html.escape(str(t_data[0]['ticket_number']))}</b> вернули.\n⚠️ Причина: <i>{html.escape(str(message.text))}</i>\n\n{build_card(fetch_query('SELECT * FROM tickets WHERE id = ?', (ticket_id,))[0])}"
+        await notify_group(msg_text, reply_markup=return_kb)
     
     await message.answer("🔄 <i>Заявка возвращена в пул.</i>", reply_markup=main_menu_kb)
     await state.clear()

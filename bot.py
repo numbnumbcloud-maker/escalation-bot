@@ -39,9 +39,7 @@ ST_DEL = "❌ ОТМЕНЕНА"
 # === АСИНХРОННАЯ БАЗА ДАННЫХ (WAL MODE) ===
 def init_db():
     with sqlite3.connect("tickets.db", timeout=20) as conn:
-        # Включаем турбо-режим параллельной записи
         conn.execute('PRAGMA journal_mode=WAL;')
-        conn.execute('PRAGMA synchronous=NORMAL;')
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tickets (
@@ -88,7 +86,7 @@ def get_elapsed_time(assigned_at_str):
     except Exception:
         return "—"
 
-# === FSM СОСТОЯНИЯ ===
+# === FSM СОСТОЯНИЯ (ТОЛЬКО 2 ШАГА) ===
 class TicketForm(StatesGroup):
     client = State()
     comment = State()
@@ -117,9 +115,8 @@ def get_user_name(user):
     return f"@{user.username}" if user.username else user.first_name
 
 def build_card(t):
-    """Генератор текста с пуленепробиваемым экранированием типов"""
     if t['status'] == ST_DEL:
-        return f"❌ <b>ОТМЕНЕНА</b>\nЗаявка <code>#{html.escape(str(t['ticket_number'] or '—'))}</code> удалена автором."
+        return f"❌ <b>ОТМЕНЕНА</b>\nЗаявка <code>#{t['id']:04d}</code> удалена автором."
 
     assignee = html.escape(str(t['assignee'] or "—"))
     reason = f"\n⚠️ <b>Причина возврата:</b> <i>{html.escape(str(t['return_reason']))}</i>" if t['return_reason'] else ""
@@ -128,7 +125,7 @@ def build_card(t):
     time_info = f"\n⏱ <b>В работе:</b> {get_elapsed_time(t['assigned_at'])}" if (t['status'] == ST_WIP and t['assigned_at']) else ""
     
     return (
-        f"🎫 <b>Заявка</b> <code>#{html.escape(str(t['ticket_number'] or '—'))}</code>\n"
+        f"🎫 <b>Заявка</b> <code>#{t['id']:04d}</code>\n"
         f"Статус: <b>{t['status']}</b> | Приоритет: <b>{t['urgency']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Клиент:</b> {html.escape(str(t['client_name'] or '—'))}\n"
@@ -161,79 +158,20 @@ async def edit_card(chat_id, message_id, t, reply_markup=None):
         else:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
 
-# === СМАРТ-РЕПЛАИ ===
-@dp.message(F.reply_to_message & F.chat.type.in_({"group", "supergroup"}))
-async def handle_smart_reply(message: Message):
-    if message.reply_to_message.from_user.is_bot:
-        t_data = await fetch_query("SELECT * FROM tickets WHERE group_message_id = ?", (message.reply_to_message.message_id,))
-        if t_data and t_data[0]['status'] not in [ST_DONE, ST_DEL]:
-            t = t_data[0]
-            raw_text = message.text or message.caption or "Медиа-ответ"
-            note = f"{raw_text[:100]} ({get_user_name(message.from_user)})"
-            
-            await execute_query("UPDATE tickets SET senior_note = ? WHERE id = ?", (note, t['id']))
-            updated_t = (await fetch_query("SELECT * FROM tickets WHERE id = ?", (t['id'],)))[0]
-            
-            await edit_card(message.chat.id, t['group_message_id'], updated_t, get_action_kb(t['id'], updated_t['status'] == ST_WIP))
-            with suppress(TelegramBadRequest): await message.delete()
+# ========================================================================
+# 1. ПЕРЕХВАТЧИКИ МЕНЮ (НАХОДЯТСЯ СТРОГО ВВЕРХУ, ЧТОБЫ ОТМЕНЯТЬ ЗАВИСАНИЯ)
+# ========================================================================
 
-# === ФОНОВЫЕ ТАЙМЕРЫ ===
-async def monitor_tasks():
-    while True:
-        await asyncio.sleep(60)
-        try:
-            # Аларм (15 минут)
-            alarm_tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? AND urgency = '🔴 Высокий' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')", (ST_NEW,))
-            for t in alarm_tickets:
-                try:
-                    sent_msg = await send_card(GROUP_ID, t, get_action_kb(t['id'], False))
-                    await execute_query("UPDATE tickets SET alarm_sent = 1, group_message_id = ? WHERE id = ?", (sent_msg.message_id, t['id']))
-                    if t['group_message_id']:
-                        with suppress(TelegramBadRequest): await bot.delete_message(chat_id=GROUP_ID, message_id=t['group_message_id'])
-                except Exception as e:
-                    logging.error(f"Аларм ошибка: {e}")
-
-            # SLA (1 час)
-            sla_tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? AND sla_reminded = 0 AND assigned_at <= datetime('now', '-1 hour')", (ST_WIP,))
-            for t in sla_tickets:
-                if t['assignee_id']:
-                    with suppress(TelegramBadRequest):
-                        await bot.send_message(chat_id=t['assignee_id'], text=f"⏳ <b>НАРУШЕНИЕ SLA (> 1 ЧАСА)</b>\nПожалуйста, завершите задачу или снимите её с себя!")
-                        await send_card(t['assignee_id'], t)
-                        await execute_query("UPDATE tickets SET sla_reminded = 1 WHERE id = ?", (t['id'],))
-        except Exception as e: 
-            logging.error(f"Сбой мониторинга: {e}")
-
-# === БАЗОВЫЕ КОМАНДЫ ===
 @dp.message(Command("start"), StateFilter('*'))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Система маршрутизации заявок готова к работе.\nИспользуйте меню ниже 👇", reply_markup=main_kb)
 
-@dp.message(F.text == "👥 Команда", StateFilter('*'))
-async def cmd_active_users(message: Message, state: FSMContext):
-    await state.clear()
-    tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY assignee", (ST_WIP,))
-    if not tickets: return await message.answer("В данный момент ни у кого нет задач в работе.")
-    
-    users_tasks = {}
-    for t in tickets: users_tasks.setdefault(t['assignee'], []).append(t)
-    
-    text = "👥 <b>РАБОЧИЙ МОНИТОРИНГ:</b>\n━━━━━━━━━━━━━━━━━━\n"
-    for user, tasks in users_tasks.items():
-        text += f"👤 <b>{html.escape(user)}</b>:\n"
-        for t in tasks: text += f" ├ 🎫 <code>#{html.escape(str(t['ticket_number']))}</code> (⏱ {get_elapsed_time(t['assigned_at'])})\n"
-        text += "\n"
-    await message.answer(text)
-
-@dp.message(F.text == "🗄 Архив", StateFilter('*'))
-async def cmd_archive(message: Message, state: FSMContext):
-    await state.clear()
-    tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT 5", (ST_DONE,))
-    if not tickets: return await message.answer("🗄 Архив пуст.")
-    
-    await message.answer("🗄 <b>Последние 5 выполненных задач:</b>")
-    for t in tickets: await send_card(message.chat.id, t)
+@dp.message(F.text == "📝 Создать", StateFilter('*'))
+async def ticket_start(message: Message, state: FSMContext):
+    await state.clear() # Сбрасываем старые состояния
+    await message.answer("👤 <b>Введите Имя или Данные клиента:</b>")
+    await state.set_state(TicketForm.client)
 
 @dp.message(F.text == "📋 Свободные", StateFilter('*'))
 async def list_pool(message: Message, state: FSMContext):
@@ -252,21 +190,42 @@ async def list_mine(message: Message, state: FSMContext):
     await state.clear()
     tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? AND assignee_id = ?", (ST_WIP, message.from_user.id))
     if not tickets: return await message.answer("💼 У вас нет активных задач.")
-    
     for t in tickets: await send_card(message.chat.id, t, get_action_kb(t['id'], True))
 
-# === ЗАВЕДЕНИЕ ЗАЯВКИ ===
-@dp.message(F.text == "📝 Создать", StateFilter('*'))
-async def ticket_start(message: Message, state: FSMContext):
+@dp.message(F.text == "👥 Команда", StateFilter('*'))
+async def cmd_active_users(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("👤 <b>Клиент (Имя/Данные):</b>")
-    await state.set_state(TicketForm.client)
+    tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY assignee", (ST_WIP,))
+    if not tickets: return await message.answer("В данный момент ни у кого нет задач в работе.")
+    
+    users_tasks = {}
+    for t in tickets: users_tasks.setdefault(t['assignee'], []).append(t)
+    
+    text = "👥 <b>РАБОЧИЙ МОНИТОРИНГ:</b>\n━━━━━━━━━━━━━━━━━━\n"
+    for user, tasks in users_tasks.items():
+        text += f"👤 <b>{html.escape(user)}</b>:\n"
+        for t in tasks: text += f" ├ 🎫 <code>#{t['id']:04d}</code> (⏱ {get_elapsed_time(t['assigned_at'])})\n"
+        text += "\n"
+    await message.answer(text)
+
+@dp.message(F.text == "🗄 Архив", StateFilter('*'))
+async def cmd_archive(message: Message, state: FSMContext):
+    await state.clear()
+    tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? ORDER BY id DESC LIMIT 5", (ST_DONE,))
+    if not tickets: return await message.answer("🗄 Архив пуст.")
+    
+    await message.answer("🗄 <b>Последние 5 выполненных задач:</b>")
+    for t in tickets: await send_card(message.chat.id, t)
+
+# ========================================================================
+# 2. ШАГИ СОЗДАНИЯ ЗАЯВКИ (ИДУТ ПОСЛЕ МЕНЮ)
+# ========================================================================
 
 @dp.message(TicketForm.client)
 async def ticket_comment(message: Message, state: FSMContext):
     raw_text = message.text or message.caption or "Без имени"
     await state.update_data(client=raw_text[:100])
-    await message.answer("💬 <b>Суть проблемы (можно отправить текст или скриншот с описанием):</b>")
+    await message.answer("💬 <b>Опишите суть проблемы (можно прикрепить фото):</b>")
     await state.set_state(TicketForm.comment)
 
 @dp.message(TicketForm.comment)
@@ -275,7 +234,7 @@ async def ticket_urgency(message: Message, state: FSMContext):
     raw_text = message.text or message.caption or "Без описания"
     
     await state.update_data(comment=raw_text[:600], photo_id=photo_id)
-    await message.answer("⚡ <b>Приоритет:</b>", reply_markup=urgency_kb)
+    await message.answer("⚡ <b>Выберите приоритет заявки:</b>", reply_markup=urgency_kb)
 
 @dp.callback_query(F.data.startswith("urgency_"))
 async def ticket_save(callback: CallbackQuery, state: FSMContext):
@@ -284,33 +243,49 @@ async def ticket_save(callback: CallbackQuery, state: FSMContext):
     urg_val = urg_map.get(callback.data, "🟢 Низкий")
     creator_name = get_user_name(callback.from_user)
     
+    # Записываем в базу и МГНОВЕННО получаем ID. Больше никакого ручного номера.
     tid = await execute_query(
-        "INSERT INTO tickets (ticket_number, client_name, comment, urgency, creator, creator_id, status, photo_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("TEMP", data.get('client', '—'), data.get('comment', '—'), urg_val, creator_name, callback.from_user.id, ST_NEW, data.get('photo_id'))
+        "INSERT INTO tickets (client_name, comment, urgency, creator, creator_id, status, photo_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (data.get('client', '—'), data.get('comment', '—'), urg_val, creator_name, callback.from_user.id, ST_NEW, data.get('photo_id'))
     )
-    
-    auto_number = f"{tid:04d}"
-    await execute_query("UPDATE tickets SET ticket_number = ? WHERE id = ?", (auto_number, tid))
     
     t_data = (await fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,)))[0]
     
     try:
         sent = await send_card(GROUP_ID, t_data, get_action_kb(tid, False))
         await execute_query("UPDATE tickets SET group_message_id = ? WHERE id = ?", (sent.message_id, tid))
-        res = f"✅ Заявка <b>#{auto_number}</b> сохранена и отправлена."
+        res = f"✅ Заявка <b>#{tid:04d}</b> сохранена и отправлена."
     except Exception as e:
-        res = f"✅ Заявка <b>#{auto_number}</b> сохранена.\n⚠️ <i>Ошибка чата: {e}</i>"
+        res = f"✅ Заявка <b>#{tid:04d}</b> сохранена.\n⚠️ <i>Ошибка чата: {e}</i>"
     
     with suppress(TelegramBadRequest): await callback.message.edit_text(res)
     await state.clear()
 
-# === ОБРАБОТЧИКИ КНОПОК ===
+# ========================================================================
+# 3. ОБРАБОТЧИКИ КНОПОК И СМАРТ-РЕПЛАИ
+# ========================================================================
+
+@dp.message(F.reply_to_message & F.chat.type.in_({"group", "supergroup"}))
+async def handle_smart_reply(message: Message):
+    if message.reply_to_message.from_user.is_bot:
+        t_data = await fetch_query("SELECT * FROM tickets WHERE group_message_id = ?", (message.reply_to_message.message_id,))
+        if t_data and t_data[0]['status'] not in [ST_DONE, ST_DEL]:
+            t = t_data[0]
+            raw_text = message.text or message.caption or "Медиа-ответ"
+            note = f"{raw_text[:100]} ({get_user_name(message.from_user)})"
+            
+            await execute_query("UPDATE tickets SET senior_note = ? WHERE id = ?", (note, t['id']))
+            updated_t = (await fetch_query("SELECT * FROM tickets WHERE id = ?", (t['id'],)))[0]
+            
+            await edit_card(message.chat.id, t['group_message_id'], updated_t, get_action_kb(t['id'], updated_t['status'] == ST_WIP))
+            with suppress(TelegramBadRequest): await message.delete()
+
 @dp.callback_query(F.data.startswith("take_"))
 async def act_take(callback: CallbackQuery):
     tid = int(callback.data.split("_")[1])
     t = await fetch_query("SELECT * FROM tickets WHERE id = ?", (tid,))
     
-    if not t: return await callback.answer("⚠️ Заявка не найдена!", show_alert=True)
+    if not t: return await callback.answer("⚠️ Заявка не найдена в базе!", show_alert=True)
     if t[0]["status"] != ST_NEW:
         with suppress(TelegramBadRequest): await callback.message.edit_reply_markup(reply_markup=None)
         return await callback.answer("⚠️ Статус изменен (Отменена или взята)!", show_alert=True)
@@ -382,7 +357,7 @@ async def act_return(callback: CallbackQuery, state: FSMContext):
         await user_state.set_state(ReturnForm.reason)
         await user_state.update_data(ticket_id=tid)
         try:
-            await bot.send_message(callback.from_user.id, f"✍️ <b>Причина снятия задачи <code>#{t[0]['ticket_number']}</code>:</b>\n<i>(Будет возвращена в 'Свободные')</i>")
+            await bot.send_message(callback.from_user.id, f"✍️ <b>Причина снятия задачи <code>#{tid:04d}</code>:</b>\n<i>(Используйте меню для отмены)</i>")
             await callback.answer("Напишите причину в личных сообщениях бота!", show_alert=True)
         except Exception:
             await callback.answer("⚠️ ОШИБКА: Запустите бота в личке!", show_alert=True)
@@ -410,11 +385,36 @@ async def act_return_save(message: Message, state: FSMContext):
     await message.answer("🔄 Заявка возвращена в пул.", reply_markup=main_kb)
     await state.clear()
 
-# === ЗАПУСК ===
+# ========================================================================
+# 4. ФОНОВЫЕ ЗАДАЧИ И ЗАПУСК БОТА
+# ========================================================================
+
+async def monitor_tasks():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            alarm_tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? AND urgency = '🔴 Высокий' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')", (ST_NEW,))
+            for t in alarm_tickets:
+                try:
+                    sent_msg = await send_card(GROUP_ID, t, get_action_kb(t['id'], False))
+                    await execute_query("UPDATE tickets SET alarm_sent = 1, group_message_id = ? WHERE id = ?", (sent_msg.message_id, t['id']))
+                    if t['group_message_id']:
+                        with suppress(TelegramBadRequest): await bot.delete_message(chat_id=GROUP_ID, message_id=t['group_message_id'])
+                except Exception: pass
+
+            sla_tickets = await fetch_query("SELECT * FROM tickets WHERE status = ? AND sla_reminded = 0 AND assigned_at <= datetime('now', '-1 hour')", (ST_WIP,))
+            for t in sla_tickets:
+                if t['assignee_id']:
+                    with suppress(TelegramBadRequest):
+                        await bot.send_message(chat_id=t['assignee_id'], text=f"⏳ <b>НАРУШЕНИЕ SLA (> 1 ЧАСА)</b>\nПожалуйста, завершите задачу или снимите её с себя!")
+                        await send_card(t['assignee_id'], t)
+                        await execute_query("UPDATE tickets SET sla_reminded = 1 WHERE id = ?", (t['id'],))
+        except Exception: pass
+
 async def on_startup():
     init_db()
     asyncio.create_task(monitor_tasks())
-    logging.info("СИСТЕМА ENTERPRISE ЗАПУЩЕНА")
+    logging.info("🚀 СИСТЕМА УЛЬТИМАТИВНО ЗАПУЩЕНА")
 
 async def main():
     dp.startup.register(on_startup)

@@ -2,22 +2,27 @@ import asyncio
 import logging
 import sqlite3
 import html
+import os
 from contextlib import suppress
+
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
 
-logging.basicConfig(level=logging.INFO)
+# === НАСТРОЙКИ ===
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# === ТВОИ ДАННЫЕ ===
+# Вставь сюда свои данные
 BOT_TOKEN = "8684957172:AAHhJAfdLnbmAw-AAAYuvNI0j8q0dz9IBYA"
-# ВАЖНО: Укажи ID чата БЕЗ КАВЫЧЕК, как обычное число с минусом!
-SENIOR_CHAT_ID = -1004340807494 
+SENIOR_CHAT_ID = -1004340807494  # Строго без кавычек, просто число с минусом!
 
-bot = Bot(token=BOT_TOKEN)
+# Инициализация бота с глобальным HTML
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # === БАЗА ДАННЫХ ===
@@ -43,6 +48,7 @@ def init_db():
                 alarm_sent INTEGER DEFAULT 0
             )
         ''')
+        # Автоматическая миграция новых колонок
         columns = [
             ("creator_id", "INTEGER"), ("assignee_id", "INTEGER"), 
             ("return_reason", "TEXT"), ("assigned_at", "TIMESTAMP"), 
@@ -69,7 +75,7 @@ def fetch_query(query, params=()):
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
 
-# === СОСТОЯНИЯ ===
+# === СОСТОЯНИЯ FSM ===
 class EscalateForm(StatesGroup):
     ticket_number = State()
     client_name = State()
@@ -79,7 +85,7 @@ class ReturnForm(StatesGroup):
     ticket_id = State()
     reason = State()
 
-# === МЕНЮ ===
+# === МЕНЮ И КЛАВИАТУРЫ ===
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Создать"), KeyboardButton(text="📋 Пул")],
@@ -98,12 +104,13 @@ urgency_kb = InlineKeyboardMarkup(inline_keyboard=[
 def get_user_name(user):
     return f"@{user.username}" if user.username else user.first_name
 
-# БРОНИРОВАННЫЙ БИЛДЕР КАРТОЧЕК (С защитой от плохих символов)
 def build_card(t):
+    """Генератор неуязвимых HTML-карточек"""
     status_icon = "🆕" if t['status'] == "🔴 НОВАЯ" else "⏳" if t['status'] == "🟡 В РАБОТЕ" else "✅"
     assignee = html.escape(str(t['assignee'])) if t['assignee'] else "⏳ Ожидает"
+    
     reason_text = html.escape(str(t['return_reason'])) if t['return_reason'] else ""
-    reason = f"\n⚠️ <b>Причина возврата:</b> <i>{reason_text}</i>" if reason_text else ""
+    reason_block = f"\n⚠️ <b>Причина возврата:</b> <i>{reason_text}</i>" if reason_text else ""
     
     return (
         f"{status_icon} <b>{t['status']}</b>\n"
@@ -111,45 +118,45 @@ def build_card(t):
         f"🆔 <b>№:</b> {html.escape(str(t['ticket_number']))}\n"
         f"👤 <b>Клиент:</b> {html.escape(str(t['client_name']))}\n"
         f"⚡ <b>Срочность:</b> {t['urgency']}\n"
-        f"💬 <b>Суть:</b> {html.escape(str(t['comment']))}{reason}\n"
+        f"💬 <b>Суть:</b> {html.escape(str(t['comment']))}{reason_block}\n"
         f"➖➖➖➖➖➖➖➖\n"
         f"✍️ <b>Автор:</b> {html.escape(str(t['creator']))}\n"
         f"🛠 <b>Взял:</b> {assignee}"
     )
 
-# === СИСТЕМА УВЕДОМЛЕНИЙ С ВОЗВРАТОМ ОШИБОК ===
+# === СИСТЕМА УВЕДОМЛЕНИЙ В ГРУППУ ===
 async def notify_group(text):
     try:
-        chat_id = int(SENIOR_CHAT_ID) if str(SENIOR_CHAT_ID).lstrip('-').isdigit() else SENIOR_CHAT_ID
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await bot.send_message(chat_id=SENIOR_CHAT_ID, text=text)
         return True, ""
     except Exception as e:
+        logging.error(f"Ошибка уведомления в группу: {e}")
         return False, str(e)
 
-# === ФОНОВЫЙ МОНИТОРИНГ ===
-async def monitor_tasks(bot: Bot):
+# === ФОНОВЫЕ ПРОЦЕССЫ (SLA И АЛАРМЫ) ===
+async def monitor_tasks():
     while True:
         await asyncio.sleep(60)
         try:
+            # Аларм: Важные задачи лежат более 15 минут
             alarm_tickets = fetch_query("SELECT * FROM tickets WHERE status = '🔴 НОВАЯ' AND urgency = '🔴 Высокая' AND alarm_sent = 0 AND created_at <= datetime('now', '-15 minutes')")
             for t in alarm_tickets:
-                msg = f"🔥 <b>АЛАРМ! ЗАЯВКА ГОРИТ!</b>\nНикто не берет важную задачу!\n\n" + build_card(t)
-                await notify_group(msg)
+                await notify_group(f"🔥 <b>АЛАРМ! ЗАЯВКА ГОРИТ!</b>\nНикто не берет важную задачу!\n\n{build_card(t)}")
                 execute_query("UPDATE tickets SET alarm_sent = 1 WHERE id = ?", (t['id'],))
 
+            # SLA: Задачи в работе более 2 часов
             sla_tickets = fetch_query("SELECT * FROM tickets WHERE status = '🟡 В РАБОТЕ' AND sla_reminded = 0 AND assigned_at <= datetime('now', '-2 hours')")
             for t in sla_tickets:
                 if t['assignee_id']:
-                    msg = f"⏱ <b>SLA НАПОМИНАНИЕ!</b>\nЗадача у вас более 2 часов. Нужна помощь?\n\n" + build_card(t)
                     with suppress(Exception):
-                        await bot.send_message(chat_id=t['assignee_id'], text=msg, parse_mode="HTML")
+                        await bot.send_message(chat_id=t['assignee_id'], text=f"⏱ <b>SLA НАПОМИНАНИЕ!</b>\nЗадача у вас более 2 часов. Нужна помощь?\n\n{build_card(t)}")
                         execute_query("UPDATE tickets SET sla_reminded = 1 WHERE id = ?", (t['id'],))
         except Exception as e:
-            logging.error(f"Monitor error: {e}")
+            logging.error(f"Ошибка монитора SLA: {e}")
 
 # === ИНФО И СТАТИСТИКА ===
-@dp.message(Command("start"))
-@dp.message(F.text == "ℹ️ Инфо")
+@dp.message(Command("start"), StateFilter('*'))
+@dp.message(F.text == "ℹ️ Инфо", StateFilter('*'))
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
     text = (
@@ -160,9 +167,9 @@ async def cmd_help(message: Message, state: FSMContext):
         "📊 <b>Стат:</b> Твои успехи.\n\n"
         "<i>Используй меню ниже 👇</i>"
     )
-    await message.answer(text, reply_markup=main_menu_kb, parse_mode="HTML")
+    await message.answer(text, reply_markup=main_menu_kb)
 
-@dp.message(F.text == "📊 Стат")
+@dp.message(F.text == "📊 Стат", StateFilter('*'))
 async def cmd_stats(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
@@ -180,11 +187,11 @@ async def cmd_stats(message: Message, state: FSMContext):
         f"✅ Решено всего: <b>{t_solved}</b>\n\n"
         f"🏆 <b>Твой вклад:</b> <b>{my_solved}</b> заявок!"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text)
 
-# === СОЗДАНИЕ ЗАЯВКИ ===
-@dp.message(F.text == "📝 Создать")
-@dp.message(Command("escalate"))
+# === 1. СОЗДАНИЕ ЗАЯВКИ ===
+@dp.message(F.text == "📝 Создать", StateFilter('*'))
+@dp.message(Command("escalate"), StateFilter('*'))
 async def start_form(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("🆔 Введите **номер заявки** (или ID):", reply_markup=main_menu_kb)
@@ -228,29 +235,24 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
         (t_data['ticket_number'], t_data['client_name'], t_data['comment'], t_data['urgency'], t_data['creator'], callback.from_user.id, t_data['status'])
     )
 
-    # ОТПРАВЛЯЕМ В ГРУППУ И ЛОВИМ ОШИБКУ
-    success, err_msg = await notify_group(f"🔔 <b>НОВАЯ ЗАЯВКА В ПУЛЕ</b>\n\n{build_card(t_data)}")
+    success, err = await notify_group(f"🔔 <b>НОВАЯ ЗАЯВКА В ПУЛЕ</b>\n\n{build_card(t_data)}")
     
-    if success:
-        response_text = "✅ Заявка создана и отправлена в группу!"
-    else:
-        response_text = f"✅ Заявка создана, НО в группу не отправлена.\n⚠️ <b>Системная ошибка:</b> <code>{err_msg}</code>\n<i>(Перешли этот текст разработчику!)</i>"
-
+    res_text = "✅ Заявка улетела в пул!" if success else f"✅ Заявка создана!\n⚠️ <i>Ошибка отправки в группу: {err}</i>"
+    
     with suppress(TelegramBadRequest):
-        await callback.message.edit_text(response_text, parse_mode="HTML")
+        await callback.message.edit_text(res_text)
     await state.clear()
 
-# === ПУЛ ЗАЯВОК ===
-@dp.message(F.text == "📋 Пул")
+# === 2. ПУЛ ЗАЯВОК ===
+@dp.message(F.text == "📋 Пул", StateFilter('*'))
 async def show_pool_tickets(message: Message, state: FSMContext):
     await state.clear()
     free_tickets = fetch_query("SELECT * FROM tickets WHERE status = '🔴 НОВАЯ' ORDER BY id DESC LIMIT 10")
 
     if not free_tickets:
-        await message.answer("📭 Пул пуст. Отдыхаем!", reply_markup=main_menu_kb)
-        return
+        return await message.answer("📭 Пул пуст. Отдыхаем!", reply_markup=main_menu_kb)
 
-    await message.answer("📋 <b>Свободные задачи:</b>", parse_mode="HTML")
+    await message.answer("📋 <b>Свободные задачи:</b>")
     user_id = message.from_user.id
 
     for t in free_tickets:
@@ -258,39 +260,37 @@ async def show_pool_tickets(message: Message, state: FSMContext):
         if t['creator_id'] == user_id:
             buttons.append([InlineKeyboardButton(text="❌ Удалить", callback_data=f"delete_{t['id']}")])
             
-        await message.answer(build_card(t), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await message.answer(build_card(t), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-# === МОИ ЗАДАЧИ ===
-@dp.message(F.text == "💼 В работе")
+# === 3. МОИ ЗАДАЧИ ===
+@dp.message(F.text == "💼 В работе", StateFilter('*'))
 async def show_my_tasks(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     my_tickets = fetch_query("SELECT * FROM tickets WHERE status = '🟡 В РАБОТЕ' AND assignee_id = ?", (user_id,))
 
     if not my_tickets:
-        await message.answer("💼 У вас нет задач. Возьмите их из пула!", reply_markup=main_menu_kb)
-        return
+        return await message.answer("💼 У вас нет задач. Возьмите их из пула!", reply_markup=main_menu_kb)
 
-    await message.answer("💼 <b>Ваши задачи:</b>", parse_mode="HTML")
+    await message.answer("💼 <b>Ваши задачи:</b>")
 
     for t in my_tickets:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Завершить", callback_data=f"close_{t['id']}")],
             [InlineKeyboardButton(text="🔄 Вернуть в пул", callback_data=f"return_{t['id']}")]
         ])
-        await message.answer(build_card(t), parse_mode="HTML", reply_markup=kb)
+        await message.answer(build_card(t), reply_markup=kb)
 
-# === ДЕЙСТВИЯ (КНОПКИ) ===
+# === ДЕЙСТВИЯ С ЗАЯВКАМИ ===
 @dp.callback_query(F.data.startswith("take_"))
 async def handle_take_task(callback: CallbackQuery):
     ticket_id = int(callback.data.split("_")[1])
     t_data = fetch_query("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
     
     if not t_data or t_data[0]["status"] != "🔴 НОВАЯ":
-        await callback.answer("⚠️ Кто-то уже забрал заявку!", show_alert=True)
         with suppress(TelegramBadRequest):
             await callback.message.delete()
-        return
+        return await callback.answer("⚠️ Кто-то уже забрал заявку!", show_alert=True)
 
     user_name = get_user_name(callback.from_user)
     execute_query("UPDATE tickets SET status = '🟡 В РАБОТЕ', assignee = ?, assignee_id = ?, assigned_at = CURRENT_TIMESTAMP, sla_reminded = 0 WHERE id = ?", 
@@ -306,7 +306,7 @@ async def handle_take_task(callback: CallbackQuery):
     ])
     
     with suppress(TelegramBadRequest):
-        await callback.message.edit_text(build_card(updated_t), reply_markup=kb, parse_mode="HTML")
+        await callback.message.edit_text(build_card(updated_t), reply_markup=kb)
     await callback.answer("✅ Взято в работу!")
 
 @dp.callback_query(F.data.startswith("close_"))
@@ -323,7 +323,7 @@ async def close_task(callback: CallbackQuery):
     await notify_group(f"✅ <b>ЗАДАЧА РЕШЕНА</b>\nЗаявку <b>№{html.escape(str(updated_t['ticket_number']))}</b> успешно закрыл {updated_t['assignee']}")
 
     with suppress(TelegramBadRequest):
-        await callback.message.edit_text(build_card(updated_t), parse_mode="HTML")
+        await callback.message.edit_text(build_card(updated_t))
     await callback.answer("🚀 Задача решена!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("delete_"))
@@ -337,7 +337,7 @@ async def delete_task(callback: CallbackQuery):
         await notify_group(f"❌ <b>ЗАЯВКА УДАЛЕНА</b>\nЗаявка <b>№{html.escape(str(t_data[0]['ticket_number']))}</b> отменена создателем.")
 
     with suppress(TelegramBadRequest):
-        await callback.message.edit_text("❌ <i>Заявка удалена.</i>", parse_mode="HTML")
+        await callback.message.edit_text("❌ <i>Заявка удалена.</i>")
     await callback.answer("Удалено.")
 
 # === ВОЗВРАТ В ПУЛ С ПРИЧИНОЙ ===
@@ -349,7 +349,7 @@ async def return_task_start(callback: CallbackQuery, state: FSMContext):
     
     await state.update_data(ticket_id=ticket_id)
     await state.set_state(ReturnForm.reason)
-    await callback.message.answer("✍️ <b>Напишите причину возврата:</b>\n<i>(Или нажмите любую кнопку меню для отмены)</i>", parse_mode="HTML")
+    await callback.message.answer("✍️ <b>Напишите причину возврата:</b>\n<i>(Или нажмите любую кнопку меню для отмены)</i>")
     await callback.answer()
 
 @dp.message(ReturnForm.reason)
@@ -366,13 +366,17 @@ async def process_return_reason(message: Message, state: FSMContext):
     if t_data:
         await notify_group(f"🔄 <b>ЗАДАЧА ВЕРНУЛАСЬ В ПУЛ</b>\nЗаявку <b>№{html.escape(str(t_data[0]['ticket_number']))}</b> вернули.\n⚠️ Причина: <i>{html.escape(str(message.text))}</i>")
     
-    await message.answer("🔄 <i>Заявка возвращена в пул.</i>", parse_mode="HTML", reply_markup=main_menu_kb)
+    await message.answer("🔄 <i>Заявка возвращена в пул.</i>", reply_markup=main_menu_kb)
     await state.clear()
 
-async def main():
+# === ЖИЗНЕННЫЙ ЦИКЛ БОТА ===
+async def on_startup():
     init_db()
-    asyncio.create_task(monitor_tasks(bot))
-    print("Ультимативная CRM с умными логами запущена!")
+    asyncio.create_task(monitor_tasks())
+    logging.info("CRM Бот успешно запущен!")
+
+async def main():
+    dp.startup.register(on_startup)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
